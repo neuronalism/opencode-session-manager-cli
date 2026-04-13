@@ -100,6 +100,7 @@ def _export_sessions(
     rows: list,
     *,
     to: Path | None,
+    to_project: Path | None,
     fmt: str,
     tree: bool,
     thinking: bool,
@@ -123,6 +124,8 @@ def _export_sessions(
 
         if to:
             out_dir = to
+        elif to_project:
+            out_dir = to_project / ".opencode" / sub_dir
         else:
             project_dir = Path(row["directory"])
             if project_dir.is_dir():
@@ -145,6 +148,7 @@ def export_session_cmd(
     ctx: typer.Context,
     session_id: str = typer.Option(..., "--from", help="Session ID to export"),
     to: Path | None = typer.Option(None, "--to", help="Output directory"),
+    to_project: Path | None = typer.Option(None, "--to-project", help="Output to project's .opencode dir"),
     fmt: str = typer.Option("markdown", "--format", "-f", help="Export format: markdown or raw"),
     tree: bool = typer.Option(False, "--tree", help="Export session and all subagent sessions (tree layout)"),
     flat: bool = typer.Option(False, "--flat", help="Export session and all subagent sessions (flat layout)"),
@@ -163,7 +167,7 @@ def export_session_cmd(
                 console.print(f"[red]Error:[/red] Session '{session_id}' not found.")
                 raise typer.Exit(1)
             rows = [row]
-        exported = _export_sessions(conn, rows, to=to, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls)
+        exported = _export_sessions(conn, rows, to=to, to_project=to_project, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls)
     finally:
         conn.close()
     for p in exported:
@@ -175,6 +179,7 @@ def export_project_cmd(
     ctx: typer.Context,
     project: str = typer.Option(..., "--from", help="Project directory path"),
     to: Path | None = typer.Option(None, "--to", help="Output directory"),
+    to_project: Path | None = typer.Option(None, "--to-project", help="Output to project's .opencode dir"),
     fmt: str = typer.Option("markdown", "--format", "-f", help="Export format: markdown or raw"),
     tree: bool = typer.Option(False, "--tree", help="Export with subagent sessions (tree layout)"),
     flat: bool = typer.Option(False, "--flat", help="Export with subagent sessions (flat layout)"),
@@ -192,7 +197,7 @@ def export_project_cmd(
         if not rows:
             console.print(f"[red]Error:[/red] No sessions found for project '{project}'.")
             raise typer.Exit(1)
-        exported = _export_sessions(conn, rows, to=to, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls)
+        exported = _export_sessions(conn, rows, to=to, to_project=to_project, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls)
     finally:
         conn.close()
     for p in exported:
