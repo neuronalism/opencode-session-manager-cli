@@ -73,6 +73,13 @@ Default export path:
 - `OCSM_DB_PATH=<path> ocsm list session`
 - Default: `~/.config/opencode/opencode.db`
 
+## Development
+
+- [x] list sessions and projects
+- [x] export sessions and projects
+- [ ] import raw jsons into database
+- [ ] sync conversations with local project folders
+
 ## License
 
 MIT
