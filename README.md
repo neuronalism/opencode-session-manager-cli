@@ -1,10 +1,10 @@
-# OpenCode Session Manager
+# OpenCode Session Manager CLI
 
 A simple CLI tool for managing [OpenCode](https://github.com/opencode-ai/opencode) sessions stored in SQLite. It handles renamed/removed project folders, allows exporting all conversations of a project in markdown format, and provides a way to even import raw jsons into database.
 
 Inspired by [BrianLan's export-opencode-sessions Skills](https://github.com/brianlan/improved-ai-agent/tree/master/skills/export-opencode-sessions). 
 
-Tested on OpenCode v1.4.3.
+Tested on OpenCode v1.4.3 on Windows.
 
 > [!CAUTION]
 >
@@ -49,19 +49,19 @@ ocsm export session --from <ses_id> --to-project /path/to/proj   # output to <pr
 **Export** all sessions in a project:
 
 ```bash
-ocsm export project --from /path/to/proj                            # export all sessions of a project
+ocsm export project --from /path/to/proj                            # export all top-level sessions of a project
 ocsm export project --from /path/to/proj --format raw               # raw JSON
 ocsm export project --from /path/to/proj --tree                     # with subagents
 ocsm export project --from /path/to/proj --flat                     # with subagents (flat)
 ```
 
-Options for **exporting**:
+Options for exporting:
 
 ```bash
 --format markdown                    # default, export as markdown. 
---format raw                         # raw JSON, faithful DB snapshot for re-import. Default export path: <project>/.opencode/raw_conversations/
---thinking True                      # include reasoning parts (default)
---thinking False                     # hide reasoning parts
+--format raw                         # raw JSON (import-safe)
+--thinking True                      # include reasoning parts (default True)
+--thinking False                     # hide reasoning parts (default)
 --tool-call none                     # hide tool calls
 --tool-call info                     # show tool name, title, linked session (default)
 --tool-call details                  # show tool name, title, session, input, output, error
@@ -70,7 +70,8 @@ Options for **exporting**:
 ```
 
 Default export path: 
-- `<project>/.opencode/conversations/` for markdown, and `<project>/.opencode/raw_conversations/` for raw JSON.
+- `<project>/.opencode/conversations/` for markdown, and 
+- `<project>/.opencode/raw_conversations/` for raw JSON.
 - If the default export path no longer exists, falls back to `cwd`.
 
 #### Importing
