@@ -309,3 +309,17 @@ def substitute_paths(conn: sqlite3.Connection, session_ids: list[str], old_path:
                 [old_json, new_json] + session_ids,
             )
     return {sid: c for sid, c in counts.items() if c > 0}
+
+
+def update_session_directory(
+    conn: sqlite3.Connection, session_ids: list[str], old_path: str, new_path: str
+) -> int:
+    """Update session.directory from old_path to new_path for the given session IDs."""
+    if not session_ids or old_path == new_path:
+        return 0
+    placeholders = ", ".join(["?"] * len(session_ids))
+    cursor = conn.execute(
+        f"UPDATE session SET directory = ? WHERE directory = ? AND id IN ({placeholders})",
+        [new_path, old_path] + session_ids,
+    )
+    return cursor.rowcount

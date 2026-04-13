@@ -26,19 +26,23 @@ from ocsm.queries import (
     load_raw_messages,
     session_exists,
     substitute_paths,
+    update_session_directory,
     validate_session_tree,
 )
 
 app = typer.Typer(name="ocsm", help="OpenCode Sessions Manager", no_args_is_help=True)
 
-list_app = typer.Typer(name="list", help="List resources", no_args_is_help=True)
+list_app = typer.Typer(name="list", help="Show projects and sessions stored in the database", no_args_is_help=True)
 app.add_typer(list_app)
 
-export_app = typer.Typer(name="export", help="Export resources", no_args_is_help=True)
+export_app = typer.Typer(name="export", help="Export sessions as markdown or raw JSON", no_args_is_help=True)
 app.add_typer(export_app)
 
-import_app = typer.Typer(name="import", help="Import resources", no_args_is_help=True)
+import_app = typer.Typer(name="import", help="Import sessions from raw JSON into the database", no_args_is_help=True)
 app.add_typer(import_app)
+
+move_app = typer.Typer(name="move", help="Update project paths after renaming or moving a folder", no_args_is_help=True)
+app.add_typer(move_app)
 
 
 def _make_console() -> Console:
@@ -362,9 +366,10 @@ def _verify_with_opencode(project_dir: Path) -> bool:
             return False
 
         # Also try querying sessions for this project
-        dir_pattern = str(project_dir) + "%"
+        escaped = str(project_dir).replace("'", "''")
+        sql = f"SELECT COUNT(*) FROM session WHERE directory LIKE '{escaped}%';"
         result2 = subprocess.run(
-            [opencode, "db", "SELECT COUNT(*) FROM session WHERE directory LIKE ?;", dir_pattern],
+            [opencode, "db", sql],
             capture_output=True,
             text=True,
             timeout=10,
@@ -413,7 +418,7 @@ def import_session_cmd(
     ctx: typer.Context,
     json_file: Path = typer.Option(..., "--from", help="Path to raw JSON file"),
     to_project: Path = typer.Option(..., "--to-project", help="Local project directory to map to"),
-    substitute_paths_flag: bool = typer.Option(False, "--substitute-paths", help="Replace old paths in data fields"),
+    substitute_paths_flag: bool = typer.Option(True, "--substitute-paths/--no-substitute-paths", help="Replace old paths in data fields"),
 ):
     """Import a session (and its subagent tree) from a raw JSON file."""
     db_path = ctx.obj["db_path"]
@@ -452,7 +457,7 @@ def import_project_cmd(
     ctx: typer.Context,
     from_dir: Path = typer.Option(..., "--from", help="Source project directory"),
     to_project: Path = typer.Option(..., "--to-project", help="Local project directory to map to"),
-    substitute_paths_flag: bool = typer.Option(False, "--substitute-paths", help="Replace old paths in data fields"),
+    substitute_paths_flag: bool = typer.Option(True, "--substitute-paths/--no-substitute-paths", help="Replace old paths in data fields"),
 ):
     """Import all sessions from a project's raw export directory."""
     db_path = ctx.obj["db_path"]
@@ -514,3 +519,87 @@ def import_project_cmd(
     _import_report(result)
     if result["imported"]:
         _verify_with_opencode(to_project)
+
+
+@move_app.command("project")
+def move_project_cmd(
+    ctx: typer.Context,
+    from_dir: Path = typer.Option(..., "--from", help="Original project directory path"),
+    to_project: Path = typer.Option(..., "--to-project", help="New project directory path"),
+):
+    """Move all sessions from one project directory to another."""
+    db_path = ctx.obj["db_path"]
+    old_path = str(from_dir.expanduser().resolve())
+    new_path = str(to_project.expanduser().resolve())
+
+    if old_path == new_path:
+        console.print("[yellow]Source and destination paths are the same. Nothing to do.[/yellow]")
+        raise typer.Exit(0)
+
+    conn = get_connection(db_path)
+    try:
+        rows = list_sessions(conn, old_path, include_children=True)
+    finally:
+        conn.close()
+
+    if not rows:
+        console.print(f"[yellow]No sessions found for directory '{old_path}'.[/yellow]")
+        raise typer.Exit(1)
+
+    session_ids = [row["id"] for row in rows]
+    console.print(f"Found {len(session_ids)} session(s) matching '{old_path}'")
+
+    # Check for existing sessions at target (merge scenario)
+    conn2 = get_connection(db_path)
+    try:
+        target_rows = list_sessions(conn2, new_path, include_children=True)
+    finally:
+        conn2.close()
+
+    skipped_ids: list[str] = []
+    if target_rows:
+        target_ids = {row["id"] for row in target_rows}
+        skipped_ids = [sid for sid in session_ids if sid in target_ids]
+        session_ids = [sid for sid in session_ids if sid not in target_ids]
+        if skipped_ids:
+            console.print(f"[yellow]Warning: {len(skipped_ids)} session(s) already exist at target, will be skipped[/yellow]")
+        if not session_ids:
+            console.print("[yellow]All sessions already exist at target. Nothing to move.[/yellow]")
+            raise typer.Exit(0)
+
+    console.print(f"Moving {len(session_ids)} session(s) to '{new_path}'...")
+
+    backup_path = _checkpoint_and_backup(db_path)
+
+    conn = get_connection(db_path)
+    try:
+        conn.execute("BEGIN")
+        dir_updated = update_session_directory(conn, session_ids, old_path, new_path)
+        path_sub_counts = substitute_paths(conn, session_ids, old_path, new_path)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        console.print("[red]Error during move operation.[/red]")
+        console.print("[dim]The database was rolled back. Your data is unchanged.[/dim]")
+        raise typer.Exit(1)
+    finally:
+        conn.close()
+
+    console.print(f"[green]Moved {len(session_ids)} session(s):[/green]")
+    if skipped_ids:
+        console.print(f"[yellow]Skipped {len(skipped_ids)} session(s) (already exist at target):[/yellow]")
+        for sid in skipped_ids:
+            console.print(f"  {sid}")
+    console.print(f"  session.directory updated: {dir_updated} row(s)")
+    total_data = sum(path_sub_counts.values())
+    if total_data:
+        console.print(f"  path substitution: {total_data} row(s) updated in {len(path_sub_counts)} session(s)")
+        for sid, count in path_sub_counts.items():
+            console.print(f"    {sid}: {count} row(s)")
+    else:
+        console.print("  path substitution: no data fields contained the old path")
+
+    console.print(f"\n[dim]Backup: {backup_path}[/dim]")
+    console.print("[dim]Delete the backup manually once you confirm everything works.[/dim]")
+
+    _verify_with_opencode(to_project)

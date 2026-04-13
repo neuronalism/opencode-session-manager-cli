@@ -68,18 +68,25 @@ Options for **exporting**:
 **Import** a session:
 
 ```bash
-ocsm import session --from /path/to/session.json --to-project /path/to/proj        # import one session tree, keeping all contents intact
-ocsm import session --from /path/to/session.json --to-project /path/to/proj --substitute-paths  # also replace paths in data fields
+ocsm import session --from /path/to/session.json --to-project /path/to/proj        # import one session tree
+ocsm import session --from /path/to/session.json --to-project /path/to/proj --no-substitute-paths  # import without replacing paths in the conversations
 ocsm import project --from /path/to/proj --to-project /path/to/proj                # import all sessions from a project's raw export
-ocsm import project --from /path/to/proj --to-project /path/to/proj --substitute-paths
+ocsm import project --from /path/to/proj --to-project /path/to/proj --no-substitute-paths
 ```
+
+**Move** a project (after renaming/moving the folder):
+
+```bash
+ocsm move project --from /old/path --to-project /new/path     # update all session paths in the database
+```
+
+If the target directory already has sessions, conflicting session IDs are skipped (merged).
 
 Import only accepts raw JSON files (exported with `--format raw`). The import pipeline is:
 
 1. SQLite WAL checkpoint to flush all cached data
 2. Full database backup (timestamped `.bak` file)
-3. Import sessions (skips existing IDs, replaces `session.directory`)
-   - Caution: if `substitute-paths` is set, it will also replace all paths in the data, so that the context appears as a native session in the target project. This should help deal with issues like syncing with a remote repo, etc.
+3. Import sessions (skips existing IDs, replaces `session.directory` and paths in the conversation by default)
 4. Tree integrity validation
 5. OpenCode runtime verification (`opencode db PRAGMA integrity_check`)
 6. Report results — user must MANUALLY delete the backup file after this
@@ -100,6 +107,7 @@ Default export path:
 - [x] list sessions and projects
 - [x] export sessions and projects
 - [x] import raw jsons into database
+- [x] move project paths (after rename/relocate)
 - [ ] sync conversations with local project folders
 
 ## License
