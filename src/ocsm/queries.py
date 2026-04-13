@@ -103,7 +103,7 @@ def load_messages(conn: sqlite3.Connection, session_id: str) -> list:
 
     parts = conn.execute(
         """
-        SELECT id, session_id, message_id, data
+        SELECT id, session_id, message_id, time_created, time_updated, data
         FROM part
         WHERE session_id = ?
         ORDER BY time_created ASC
@@ -148,7 +148,7 @@ def load_raw_messages(conn: sqlite3.Connection, session_id: str) -> dict:
 
     parts = conn.execute(
         """
-        SELECT id, session_id, message_id, data
+        SELECT id, session_id, message_id, time_created, time_updated, data
         FROM part
         WHERE session_id = ?
         ORDER BY time_created ASC
@@ -177,3 +177,135 @@ def get_session_tree(conn: sqlite3.Connection, session_id: str) -> list[sqlite3.
             rows.append(child)
         i += 1
     return [r for r in rows if r is not None]
+
+
+# --- Import functions ---
+
+SESSION_COLUMNS = [
+    "id", "project_id", "parent_id", "slug", "directory", "title", "version",
+    "share_url", "summary_additions", "summary_deletions", "summary_files",
+    "summary_diffs", "revert", "permission",
+    "time_created", "time_updated", "time_compacting", "time_archived",
+    "workspace_id",
+]
+
+MESSAGE_COLUMNS = ["id", "session_id", "time_created", "time_updated", "data"]
+
+PART_COLUMNS = ["id", "message_id", "session_id", "time_created", "time_updated", "data"]
+
+
+def session_exists(conn: sqlite3.Connection, session_id: str) -> bool:
+    row = conn.execute("SELECT 1 FROM session WHERE id = ?", (session_id,)).fetchone()
+    return row is not None
+
+
+def insert_session(conn: sqlite3.Connection, session_dict: dict) -> None:
+    cols = [c for c in SESSION_COLUMNS if c in session_dict]
+    placeholders = ", ".join(["?"] * len(cols))
+    col_names = ", ".join(cols)
+    values = [session_dict[c] for c in cols]
+    conn.execute(f"INSERT INTO session ({col_names}) VALUES ({placeholders})", values)
+
+
+def insert_messages(conn: sqlite3.Connection, messages: list[dict]) -> int:
+    if not messages:
+        return 0
+    cols = [c for c in MESSAGE_COLUMNS if c in messages[0]]
+    placeholders = ", ".join(["?"] * len(cols))
+    col_names = ", ".join(cols)
+    rows = []
+    for m in messages:
+        rows.append(tuple(m[c] for c in cols))
+    conn.executemany(f"INSERT INTO message ({col_names}) VALUES ({placeholders})", rows)
+    return len(rows)
+
+
+def insert_parts(conn: sqlite3.Connection, parts: list[dict], messages: list[dict] | None = None) -> int:
+    """Insert parts. If parts lack time_created/time_updated (old exports), derive from messages."""
+    if not parts:
+        return 0
+    # Build message time lookup for fallback
+    msg_times: dict[str, tuple[int, int]] = {}
+    if messages:
+        for m in messages:
+            tc = m.get("time_created", 0) or 0
+            tu = m.get("time_updated", 0) or 0
+            msg_times[m["id"]] = (tc, tu)
+    cols = [c for c in PART_COLUMNS if c in parts[0] or c in ("time_created", "time_updated")]
+    placeholders = ", ".join(["?"] * len(cols))
+    col_names = ", ".join(cols)
+    rows = []
+    for p in parts:
+        row = []
+        for c in cols:
+            if c in p:
+                row.append(p[c])
+            elif c in ("time_created", "time_updated"):
+                fallback = msg_times.get(p.get("message_id", ""), (0, 0))
+                row.append(fallback[0] if c == "time_created" else fallback[1])
+            else:
+                row.append(None)
+        rows.append(tuple(row))
+    conn.executemany(f"INSERT INTO part ({col_names}) VALUES ({placeholders})", rows)
+    return len(rows)
+
+
+def validate_session_tree(conn: sqlite3.Connection, root_id: str) -> list[str]:
+    """Verify root session and all its children exist in DB. Returns list of session IDs."""
+    all_ids: list[str] = [root_id]
+    i = 0
+    while i < len(all_ids):
+        children = conn.execute(
+            "SELECT id FROM session WHERE parent_id = ?", (all_ids[i],)
+        ).fetchall()
+        for child in children:
+            all_ids.append(child["id"])
+        i += 1
+    # Verify all exist
+    missing = []
+    for sid in all_ids:
+        if not session_exists(conn, sid):
+            missing.append(sid)
+    if missing:
+        raise ValueError(f"Broken tree: sessions missing in DB: {missing}")
+    return all_ids
+
+
+def substitute_paths(conn: sqlite3.Connection, session_ids: list[str], old_path: str, new_path: str) -> dict[str, int]:
+    """Replace old_path with new_path in data fields of imported sessions.
+
+    Handles both raw paths (backslashes) and JSON-escaped paths (double backslashes)
+    since data columns store JSON strings where backslashes are escaped.
+
+    Returns dict mapping session_id -> number of rows affected.
+    """
+    if not session_ids or old_path == new_path:
+        return {}
+    placeholders = ", ".join(["?"] * len(session_ids))
+    old_json = old_path.replace("\\", "\\\\")
+    new_json = new_path.replace("\\", "\\\\")
+    # Count affected rows per session_id before replacement
+    counts: dict[str, int] = {sid: 0 for sid in session_ids}
+    id_col_map = {"message": "session_id", "part": "session_id", "session": "id"}
+    search_patterns = [f"%{old_path}%"]
+    if old_json != old_path:
+        search_patterns.append(f"%{old_json}%")
+    for table, col in [("message", "data"), ("part", "data"), ("session", "summary_diffs")]:
+        id_col = id_col_map[table]
+        for pattern in search_patterns:
+            for row in conn.execute(
+                f"SELECT {id_col}, COUNT(*) FROM {table} WHERE {col} LIKE ? AND {id_col} IN ({placeholders}) GROUP BY {id_col}",
+                [pattern] + session_ids,
+            ):
+                counts[row[0]] += row[1]
+    for table, col, id_col in [("message", "data", "session_id"), ("part", "data", "session_id"), ("session", "summary_diffs", "id")]:
+        conn.execute(
+            f"UPDATE {table} SET {col} = REPLACE({col}, ?, ?) WHERE {id_col} IN ({placeholders})",
+            [old_path, new_path] + session_ids,
+        )
+        if old_json != old_path:
+            conn.execute(
+                f"UPDATE {table} SET {col} = REPLACE({col}, ?, ?) WHERE {id_col} IN ({placeholders})",
+                [old_json, new_json] + session_ids,
+            )
+    return {sid: c for sid, c in counts.items() if c > 0}

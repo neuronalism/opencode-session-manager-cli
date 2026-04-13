@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import io
+import json
+import shutil
+import sqlite3
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
@@ -9,7 +14,20 @@ from rich.console import Console
 
 from ocsm.db import get_connection, resolve_db_path
 from ocsm.format import format_projects_list, format_sessions_list, format_sessions_tree, session_to_markdown, session_to_raw_json
-from ocsm.queries import get_session, get_session_tree, list_projects, list_sessions, load_messages, load_raw_messages
+from ocsm.queries import (
+    get_session,
+    get_session_tree,
+    insert_messages,
+    insert_parts,
+    insert_session,
+    list_projects,
+    list_sessions,
+    load_messages,
+    load_raw_messages,
+    session_exists,
+    substitute_paths,
+    validate_session_tree,
+)
 
 app = typer.Typer(name="ocsm", help="OpenCode Sessions Manager", no_args_is_help=True)
 
@@ -18,6 +36,9 @@ app.add_typer(list_app)
 
 export_app = typer.Typer(name="export", help="Export resources", no_args_is_help=True)
 app.add_typer(export_app)
+
+import_app = typer.Typer(name="import", help="Import resources", no_args_is_help=True)
+app.add_typer(import_app)
 
 
 def _make_console() -> Console:
@@ -174,31 +195,322 @@ def export_session_cmd(
         console.print(f"Exported to {p}")
 
 
-@export_app.command("project")
-def export_project_cmd(
-    ctx: typer.Context,
-    project: str = typer.Option(..., "--from", help="Project directory path"),
-    to: Path | None = typer.Option(None, "--to", help="Output directory"),
-    to_project: Path | None = typer.Option(None, "--to-project", help="Output to project's .opencode dir"),
-    fmt: str = typer.Option("markdown", "--format", "-f", help="Export format: markdown or raw"),
-    tree: bool = typer.Option(False, "--tree", help="Export with subagent sessions (tree layout)"),
-    flat: bool = typer.Option(False, "--flat", help="Export with subagent sessions (flat layout)"),
-    thinking: bool = typer.Option(True, "--thinking", help="Include reasoning parts"),
-    tool_calls: str = typer.Option("info", "--tool-call", help="Tool call detail level: none, info, details"),
-):
-    """Export all sessions of a project."""
-    db_path = ctx.obj["db_path"]
-    conn = get_connection(db_path)
+# --- Import helpers ---
+
+def _validate_raw_json(data: dict) -> tuple[dict, list[dict], list[dict]]:
+    """Validate raw JSON structure and return (session, messages, parts)."""
+    for key in ("session", "messages", "parts"):
+        if key not in data:
+            raise ValueError(f"Invalid raw JSON: missing '{key}' key")
+    session = data["session"]
+    if not isinstance(session, dict) or "id" not in session:
+        raise ValueError("Invalid raw JSON: 'session' must be a dict with 'id'")
+    return session, data["messages"], data["parts"]
+
+
+def _load_raw_file(path: Path) -> dict:
+    """Load and parse a raw JSON file."""
     try:
-        if tree or flat:
-            rows = list_sessions(conn, project, include_children=True)
-        else:
-            rows = list_sessions(conn, project, include_children=False)
-        if not rows:
-            console.print(f"[red]Error:[/red] No sessions found for project '{project}'.")
-            raise typer.Exit(1)
-        exported = _export_sessions(conn, rows, to=to, to_project=to_project, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls)
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        raise ValueError(f"Failed to read raw JSON file '{path}': {e}")
+
+
+def _find_tree_children(json_file: Path, root_id: str) -> list[dict]:
+    """Auto-detect subagent JSON files from tree or flat layout."""
+    json_dir = json_file.parent
+
+    # Try tree layout first: <dir>/<root_id>/*.json
+    tree_dir = json_dir / root_id
+    if tree_dir.is_dir():
+        candidates = list(tree_dir.glob("*.json"))
+    else:
+        # Fall back to flat layout: <dir>/*.json (excluding the root file itself)
+        candidates = [f for f in json_dir.glob("*.json") if f != json_file]
+
+    children = []
+    known_ids = {root_id}
+    # BFS: keep expanding as we discover new sessions
+    queue = [root_id]
+    while queue:
+        parent_id = queue.pop(0)
+        for candidate in candidates:
+            if candidate in children:
+                continue
+            try:
+                data = _load_raw_file(candidate)
+                session = data["session"]
+            except (ValueError, KeyError):
+                continue
+            if session.get("parent_id") == parent_id and session["id"] not in known_ids:
+                known_ids.add(session["id"])
+                children.append(data)
+                queue.append(session["id"])
+    return children
+
+
+def _checkpoint_and_backup(db_path: Path) -> Path:
+    """Checkpoint WAL and create a timestamped backup. Returns backup path."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         conn.close()
-    for p in exported:
-        console.print(f"Exported to {p}")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    backup_path = db_path.parent / f"{db_path.name}.bak.{timestamp}"
+    shutil.copy2(str(db_path), str(backup_path))
+    return backup_path
+
+
+def _import_session_tree(
+    db_path: Path,
+    tree_data: list[dict],
+    to_project: Path,
+    substitute: bool = False,
+) -> dict:
+    """Import a session tree into the database."""
+    if not tree_data:
+        return {"imported": 0, "skipped": 0, "session_ids": [], "backup_path": None, "old_directory": None}
+
+    backup_path = _checkpoint_and_backup(db_path)
+    new_directory = str(to_project.expanduser().resolve())
+
+    conn = get_connection(db_path)
+    try:
+        conn.execute("BEGIN")
+        imported = []
+        skipped = []
+        imported_ids = []
+        old_directory = None
+
+        for data in tree_data:
+            session, messages, parts = _validate_raw_json(data)
+
+            if session.get("parent_id") is not None and session["parent_id"] not in imported_ids:
+                skipped.append(session["id"])
+                continue
+
+            if session_exists(conn, session["id"]):
+                skipped.append(session["id"])
+                imported_ids.append(session["id"])
+                continue
+
+            if old_directory is None and session.get("parent_id") is None:
+                old_directory = session.get("directory")
+
+            session["directory"] = new_directory
+
+            insert_session(conn, session)
+            insert_messages(conn, messages)
+            insert_parts(conn, parts, messages=messages)
+            imported.append(session["id"])
+            imported_ids.append(session["id"])
+
+        path_sub_counts = {}
+        if substitute and old_directory and imported_ids:
+            path_sub_counts = substitute_paths(conn, imported_ids, old_directory, new_directory)
+
+        for data in tree_data:
+            session = data["session"]
+            if session.get("parent_id") is None and session["id"] in imported:
+                validate_session_tree(conn, session["id"])
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "imported": imported,
+        "skipped": skipped,
+        "session_ids": imported_ids,
+        "backup_path": backup_path,
+        "old_directory": old_directory,
+        "path_sub_counts": path_sub_counts,
+    }
+
+
+def _verify_with_opencode(project_dir: Path) -> bool:
+    """Verify DB integrity using opencode db CLI.
+
+    Returns True if no errors detected, None if skipped.
+    """
+    opencode = shutil.which("opencode-cli.exe") or shutil.which("opencode-cli") or shutil.which("opencode")
+    if not opencode:
+        console.print("[yellow]Warning: opencode-cli not found, skipping runtime verification.[/yellow]")
+        return None
+
+    console.print("[cyan]Verifying with OpenCode...[/cyan]")
+    try:
+        # Use opencode db to run a simple integrity check
+        result = subprocess.run(
+            [opencode, "db", "PRAGMA integrity_check;"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        if result.returncode != 0:
+            error = result.stderr.strip()
+            console.print(f"[red]OpenCode verification failed:[/red]")
+            for line in error.split("\n")[:10]:
+                if line.strip():
+                    console.print(f"  [red]{line}[/red]")
+            return False
+
+        # Also try querying sessions for this project
+        dir_pattern = str(project_dir) + "%"
+        result2 = subprocess.run(
+            [opencode, "db", "SELECT COUNT(*) FROM session WHERE directory LIKE ?;", dir_pattern],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        if result2.returncode != 0:
+            console.print(f"[yellow]Warning: opencode db query failed, but integrity check passed.[/yellow]")
+            return True
+
+        console.print("[green]OpenCode verification passed.[/green]")
+        return True
+    except subprocess.TimeoutExpired:
+        console.print("[yellow]Warning: opencode db timed out.[/yellow]")
+        return None
+    except Exception as e:
+        console.print(f"[yellow]Warning: could not verify with OpenCode: {e}[/yellow]")
+        return None
+
+
+def _import_report(result: dict) -> None:
+    """Print import results to console."""
+    if result["imported"]:
+        console.print(f"[green]Imported {len(result['imported'])} session(s):[/green]")
+        for sid in result["imported"]:
+            console.print(f"  {sid}")
+    if result["skipped"]:
+        console.print(f"[yellow]Skipped {len(result['skipped'])} session(s) (already exist):[/yellow]")
+        for sid in result["skipped"]:
+            console.print(f"  {sid}")
+    if not result["imported"] and not result["skipped"]:
+        console.print("[yellow]Nothing to import.[/yellow]")
+        return
+    path_counts = result.get("path_sub_counts", {})
+    if path_counts:
+        total = sum(path_counts.values())
+        console.print(f"\n[cyan]Path substitution: {total} row(s) updated in {len(path_counts)} session(s)[/cyan]")
+        for sid, count in path_counts.items():
+            console.print(f"  {sid}: {count} row(s)")
+    if result["backup_path"]:
+        console.print(f"\n[dim]Backup: {result['backup_path']}[/dim]")
+        console.print("[dim]Delete the backup manually once you confirm everything works.[/dim]")
+
+
+@import_app.command("session")
+def import_session_cmd(
+    ctx: typer.Context,
+    json_file: Path = typer.Option(..., "--from", help="Path to raw JSON file"),
+    to_project: Path = typer.Option(..., "--to-project", help="Local project directory to map to"),
+    substitute_paths_flag: bool = typer.Option(False, "--substitute-paths", help="Replace old paths in data fields"),
+):
+    """Import a session (and its subagent tree) from a raw JSON file."""
+    db_path = ctx.obj["db_path"]
+
+    try:
+        data = _load_raw_file(json_file)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    session, messages, parts = _validate_raw_json(data)
+
+    if session.get("parent_id") is not None:
+        console.print("[red]Error:[/red] This file is a subagent session (has parent_id). Import from the root session instead.")
+        raise typer.Exit(1)
+
+    children = _find_tree_children(json_file, session["id"])
+    tree_data = [data] + children
+
+    console.print(f"Found {len(tree_data)} session(s) to import (1 root + {len(children)} subagents)")
+
+    try:
+        result = _import_session_tree(db_path, tree_data, to_project, substitute=substitute_paths_flag)
+    except Exception as e:
+        console.print(f"[red]Error during import: {e}[/red]")
+        console.print("[dim]The database was rolled back. Your data is unchanged.[/dim]")
+        raise typer.Exit(1)
+
+    _import_report(result)
+    if result["imported"]:
+        _verify_with_opencode(to_project)
+
+
+@import_app.command("project")
+def import_project_cmd(
+    ctx: typer.Context,
+    from_dir: Path = typer.Option(..., "--from", help="Source project directory"),
+    to_project: Path = typer.Option(..., "--to-project", help="Local project directory to map to"),
+    substitute_paths_flag: bool = typer.Option(False, "--substitute-paths", help="Replace old paths in data fields"),
+):
+    """Import all sessions from a project's raw export directory."""
+    db_path = ctx.obj["db_path"]
+
+    raw_dir = from_dir / ".opencode" / "raw_conversations"
+    if not raw_dir.is_dir():
+        console.print(f"[red]Error:[/red] No raw export directory found at '{raw_dir}'")
+        raise typer.Exit(1)
+
+    json_files = sorted(raw_dir.glob("*.json")) + sorted(raw_dir.glob("*/*.json"))
+    if not json_files:
+        console.print(f"[red]Error:[/red] No JSON files found in '{raw_dir}'")
+        raise typer.Exit(1)
+
+    all_data: dict[str, dict] = {}
+    roots: list[str] = []
+
+    for jf in json_files:
+        try:
+            data = _load_raw_file(jf)
+            session, _, _ = _validate_raw_json(data)
+            sid = session["id"]
+            if sid in all_data:
+                continue
+            all_data[sid] = data
+            if session.get("parent_id") is None:
+                roots.append(sid)
+        except ValueError as e:
+            console.print(f"[yellow]Warning: skipping {jf.name}: {e}[/yellow]")
+            continue
+
+    if not roots:
+        console.print("[red]Error:[/red] No root sessions found in the export directory.")
+        raise typer.Exit(1)
+
+    console.print(f"Found {len(roots)} root session(s) in '{raw_dir}'")
+
+    all_tree_data = []
+    for root_id in roots:
+        tree = [all_data[root_id]]
+        queue = [root_id]
+        while queue:
+            parent_id = queue.pop(0)
+            for sid, data in all_data.items():
+                if sid not in [t["session"]["id"] for t in tree] and data["session"].get("parent_id") == parent_id:
+                    tree.append(data)
+                    queue.append(sid)
+        all_tree_data.extend(tree)
+
+    console.print(f"Total {len(all_tree_data)} session(s) to import")
+
+    try:
+        result = _import_session_tree(db_path, all_tree_data, to_project, substitute=substitute_paths_flag)
+    except Exception as e:
+        console.print(f"[red]Error during import: {e}[/red]")
+        console.print("[dim]The database was rolled back. Your data is unchanged.[/dim]")
+        raise typer.Exit(1)
+
+    _import_report(result)
+    if result["imported"]:
+        _verify_with_opencode(to_project)
