@@ -21,7 +21,9 @@ uv tool install .
 
 ### Commands
 
-**List** local projects/sessions:
+#### Listing
+
+**List** local projects/sessions
 
 ```bash
 ocsm list project                        # list all projects
@@ -30,6 +32,8 @@ ocsm list session --project <path>       # filter by project
 ocsm list session --flat                 # include subagent sessions (flat)
 ocsm list session --tree                 # include subagent sessions (tree)
 ```
+
+#### Exporting
 
 **Export** one session:
 
@@ -65,6 +69,12 @@ Options for **exporting**:
 --flat                               # subagent sessions in same directory
 ```
 
+Default export path: 
+- `<project>/.opencode/conversations/` for markdown, and `<project>/.opencode/raw_conversations/` for raw JSON.
+- If the default export path no longer exists, falls back to `cwd`.
+
+#### Importing
+
 **Import** a session:
 
 ```bash
@@ -73,6 +83,8 @@ ocsm import session --from /path/to/session.json --to-project /path/to/proj --no
 ocsm import project --from /path/to/proj --to-project /path/to/proj                # import all sessions from a project's raw export
 ocsm import project --from /path/to/proj --to-project /path/to/proj --no-substitute-paths
 ```
+
+#### Moving/Renaming a project folder
 
 **Move** a project (after renaming/moving the folder):
 
@@ -91,24 +103,19 @@ Import only accepts raw JSON files (exported with `--format raw`). The import pi
 5. OpenCode runtime verification (`opencode db PRAGMA integrity_check`)
 6. Report results — user must MANUALLY delete the backup file after this
 
-
-Default export path: 
-- `<project>/.opencode/conversations/` for markdown, and `<project>/.opencode/raw_conversations/` for raw JSON.
-- If the default export path no longer exists, falls back to `cwd`.
-
 ### Use custom database path
 
 - `ocsm --db <path> list session`
 - `OCSM_DB_PATH=<path> ocsm list session`
 - Default: `~/.local/share/opencode/opencode.db`
 
-## Development
+## Dev Plan
 
 - [x] list sessions and projects
 - [x] export sessions and projects
 - [x] import raw jsons into database
 - [x] move project paths (after rename/relocate)
-- [ ] sync conversations with local project folders
+- [ ] sync conversations in two ways with local project folder
 
 ## License
 
