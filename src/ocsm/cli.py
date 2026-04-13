@@ -95,6 +95,51 @@ def list_sessions_cmd(
         console.print(format_sessions_list(rows))
 
 
+def _export_sessions(
+    conn,
+    rows: list,
+    *,
+    to: Path | None,
+    fmt: str,
+    tree: bool,
+    thinking: bool,
+    tool_calls: str,
+) -> list[Path]:
+    is_raw = fmt == "raw"
+    ext = "json" if is_raw else "md"
+    sub_dir = "raw_conversations" if is_raw else "conversations"
+
+    exported: list[Path] = []
+    root_id = rows[0]["id"] if rows else None
+    for row in rows:
+        sid = row["id"]
+
+        if is_raw:
+            raw = load_raw_messages(conn, sid)
+            content = session_to_raw_json(dict(row), raw)
+        else:
+            messages = load_messages(conn, sid)
+            content = session_to_markdown(dict(row), messages, thinking=thinking, tool_calls=tool_calls)
+
+        if to:
+            out_dir = to
+        else:
+            project_dir = Path(row["directory"])
+            if project_dir.is_dir():
+                out_dir = project_dir / ".opencode" / sub_dir
+            else:
+                out_dir = Path.cwd()
+
+        if tree and root_id and sid != root_id:
+            out_dir = out_dir / root_id
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        output = out_dir / f"{sid}.{ext}"
+        output.write_text(content, encoding="utf-8")
+        exported.append(output)
+    return exported
+
+
 @export_app.command("session")
 def export_session_cmd(
     ctx: typer.Context,
@@ -103,8 +148,8 @@ def export_session_cmd(
     fmt: str = typer.Option("markdown", "--format", "-f", help="Export format: markdown or raw"),
     tree: bool = typer.Option(False, "--tree", help="Export session and all subagent sessions (tree layout)"),
     flat: bool = typer.Option(False, "--flat", help="Export session and all subagent sessions (flat layout)"),
-    thinking: bool = typer.Option(False, "--thinking", help="Include reasoning parts"),
-    details: bool = typer.Option(False, "--tool-details", help="Include tool input/output"),
+    thinking: bool = typer.Option(True, "--thinking", help="Include reasoning parts"),
+    tool_calls: str = typer.Option("info", "--tool-call", help="Tool call detail level: none, info, details"),
 ):
     """Export a session as markdown or raw JSON."""
     db_path = ctx.obj["db_path"]
@@ -118,40 +163,37 @@ def export_session_cmd(
                 console.print(f"[red]Error:[/red] Session '{session_id}' not found.")
                 raise typer.Exit(1)
             rows = [row]
-
-        is_raw = fmt == "raw"
-        ext = "json" if is_raw else "md"
-        sub_dir = "raw_conversations" if is_raw else "conversations"
-
-        exported: list[Path] = []
-        for row in rows:
-            sid = row["id"]
-
-            if is_raw:
-                raw = load_raw_messages(conn, sid)
-                content = session_to_raw_json(dict(row), raw)
-            else:
-                messages = load_messages(conn, sid)
-                content = session_to_markdown(dict(row), messages, thinking=thinking, details=details)
-
-            if to:
-                out_dir = to
-            else:
-                project_dir = Path(row["directory"])
-                if project_dir.is_dir():
-                    out_dir = project_dir / ".opencode" / sub_dir
-                else:
-                    out_dir = Path.cwd()
-
-            if tree and sid != session_id:
-                out_dir = out_dir / session_id
-
-            out_dir.mkdir(parents=True, exist_ok=True)
-            output = out_dir / f"{sid}.{ext}"
-            output.write_text(content, encoding="utf-8")
-            exported.append(output)
+        exported = _export_sessions(conn, rows, to=to, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls)
     finally:
         conn.close()
+    for p in exported:
+        console.print(f"Exported to {p}")
 
+
+@export_app.command("project")
+def export_project_cmd(
+    ctx: typer.Context,
+    project: str = typer.Option(..., "--from", help="Project directory path"),
+    to: Path | None = typer.Option(None, "--to", help="Output directory"),
+    fmt: str = typer.Option("markdown", "--format", "-f", help="Export format: markdown or raw"),
+    tree: bool = typer.Option(False, "--tree", help="Export with subagent sessions (tree layout)"),
+    flat: bool = typer.Option(False, "--flat", help="Export with subagent sessions (flat layout)"),
+    thinking: bool = typer.Option(True, "--thinking", help="Include reasoning parts"),
+    tool_calls: str = typer.Option("info", "--tool-call", help="Tool call detail level: none, info, details"),
+):
+    """Export all sessions of a project."""
+    db_path = ctx.obj["db_path"]
+    conn = get_connection(db_path)
+    try:
+        if tree or flat:
+            rows = list_sessions(conn, project, include_children=True)
+        else:
+            rows = list_sessions(conn, project, include_children=False)
+        if not rows:
+            console.print(f"[red]Error:[/red] No sessions found for project '{project}'.")
+            raise typer.Exit(1)
+        exported = _export_sessions(conn, rows, to=to, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls)
+    finally:
+        conn.close()
     for p in exported:
         console.print(f"Exported to {p}")

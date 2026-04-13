@@ -84,7 +84,7 @@ def format_sessions_list(rows: list) -> Text:
     return result
 
 
-def session_to_markdown(session: dict, messages: list, *, thinking: bool = False, details: bool = False) -> str:
+def session_to_markdown(session: dict, messages: list, *, thinking: bool = False, tool_calls: str = "info") -> str:
     out = f"# {session.get('title', session['id'])}\n\n"
     out += f"**Session ID:** {session['id']}\n"
     out += f"**Directory:** {session.get('directory', '')}\n"
@@ -110,15 +110,22 @@ def session_to_markdown(session: dict, messages: list, *, thinking: bool = False
                 out += f"{part.get('text', '')}\n\n"
             elif kind == "reasoning" and thinking:
                 out += f"_Thinking:_\n\n{part.get('text', '')}\n\n"
-            elif kind == "tool":
-                out += f"**Tool: {part.get('tool', 'unknown')}**\n"
+            elif kind == "tool" and tool_calls != "none":
                 state = part.get("state", {})
-                if details and state.get("input") is not None:
-                    out += f"\n**Input:**\n```json\n{json.dumps(state.get('input'), indent=2)}\n```\n"
-                if details and state.get("status") == "completed" and state.get("output") is not None:
-                    out += f"\n**Output:**\n```\n{state.get('output')}\n```\n"
-                if details and state.get("status") == "error" and state.get("error") is not None:
-                    out += f"\n**Error:**\n```\n{state.get('error')}\n```\n"
+                tool_name = part.get("tool", "unknown")
+                title = state.get("title", "")
+                session_id = (state.get("metadata") or {}).get("sessionId", "")
+                out += f"**Tool: {tool_name}** {title}"
+                if session_id:
+                    out += f" → `{session_id}`"
+                out += "\n"
+                if tool_calls == "details":
+                    if state.get("input") is not None:
+                        out += f"\n**Input:**\n```json\n{json.dumps(state.get('input'), indent=2)}\n```\n"
+                    if state.get("status") == "completed" and state.get("output") is not None:
+                        out += f"\n**Output:**\n```\n{state.get('output')}\n```\n"
+                    if state.get("status") == "error" and state.get("error") is not None:
+                        out += f"\n**Error:**\n```\n{state.get('error')}\n```\n"
                 out += "\n"
         out += "---\n\n"
     return out

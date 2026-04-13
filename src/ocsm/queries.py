@@ -36,10 +36,7 @@ def list_sessions(
         params = [resolved, project]
     return conn.execute(
         f"""
-        SELECT id, slug, title, directory, project_id, parent_id,
-               time_created, time_updated,
-               summary_additions, summary_deletions, summary_files
-        FROM session
+        SELECT * FROM session
         {where}
         ORDER BY time_updated DESC
         """,
