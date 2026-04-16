@@ -2,14 +2,13 @@
 
 A simple CLI tool for managing [OpenCode](https://github.com/opencode-ai/opencode) sessions stored in SQLite. It handles renamed/removed project folders, allows exporting all conversations of a project in markdown format, and provides a way to even import raw jsons into database.
 
-Inspired by [BrianLan's export-opencode-sessions Skills](https://github.com/brianlan/improved-ai-agent/tree/master/skills/export-opencode-sessions). 
+Motivated by Issues [#11231](https://github.com/anomalyco/opencode/issues/11231), [#14292](https://github.com/anomalyco/opencode/issues/14292), [#19017](https://github.com/anomalyco/opencode/issues/19017) of OpenCode, and inspired by [BrianLan's export-opencode-sessions Skills](https://github.com/brianlan/improved-ai-agent/tree/master/skills/export-opencode-sessions). 
 
 Tested on OpenCode v1.4.3 on Windows.
 
 > [!CAUTION]
->
+> 
 > This tool may manipulate your local OpenCode database. Use with caution, and make sure to backup your database before using this tool.
-
 
 ## Using this tool
 
@@ -70,6 +69,7 @@ Options for exporting:
 ```
 
 Default export path: 
+
 - `<project>/.opencode/conversations/` for markdown, and 
 - `<project>/.opencode/raw_conversations/` for raw JSON.
 - If the default export path no longer exists, falls back to `cwd`.
