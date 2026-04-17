@@ -323,3 +323,23 @@ def update_session_directory(
         [new_path, old_path] + session_ids,
     )
     return cursor.rowcount
+
+
+def update_project_worktree(conn: sqlite3.Connection, old_path: str, new_path: str) -> int:
+    """Update project.worktree from old_path to new_path.
+
+    The project table stores icon_url (base64 data URL) and icon_color, keyed by
+    worktree (the project directory).  Moving sessions without updating this table
+    causes project icons to disappear in the OpenCode web UI.
+    """
+    if old_path == new_path:
+        return 0
+    # Check if the project table exists (older DBs may not have it)
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "project" not in tables:
+        return 0
+    cursor = conn.execute(
+        "UPDATE project SET worktree = ? WHERE worktree = ?",
+        [new_path, old_path],
+    )
+    return cursor.rowcount

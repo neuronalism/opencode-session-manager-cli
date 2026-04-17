@@ -26,6 +26,7 @@ from ocsm.queries import (
     load_raw_messages,
     session_exists,
     substitute_paths,
+    update_project_worktree,
     update_session_directory,
     validate_session_tree,
 )
@@ -605,6 +606,7 @@ def move_project_cmd(
     try:
         conn.execute("BEGIN")
         dir_updated = update_session_directory(conn, session_ids, old_path, new_path)
+        project_updated = update_project_worktree(conn, old_path, new_path)
         path_sub_counts = substitute_paths(conn, session_ids, old_path, new_path)
         conn.commit()
     except Exception:
@@ -621,6 +623,8 @@ def move_project_cmd(
         for sid in skipped_ids:
             console.print(f"  {sid}")
     console.print(f"  session.directory updated: {dir_updated} row(s)")
+    if project_updated:
+        console.print(f"  project.worktree updated: {project_updated} row(s)")
     total_data = sum(path_sub_counts.values())
     if total_data:
         console.print(f"  path substitution: {total_data} row(s) updated in {len(path_sub_counts)} session(s)")
