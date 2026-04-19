@@ -1,18 +1,34 @@
 # OpenCode Session Manager CLI
 
-A simple CLI tool for managing [OpenCode](https://github.com/opencode-ai/opencode) sessions stored in SQLite. It handles renamed/removed project folders, allows exporting all conversations of a project in markdown format, and provides a way to even import raw jsons into database.
-
-Motivated by Issues [#11231](https://github.com/anomalyco/opencode/issues/11231), [#14292](https://github.com/anomalyco/opencode/issues/14292), [#19017](https://github.com/anomalyco/opencode/issues/19017) of OpenCode, and inspired by [BrianLan's export-opencode-sessions Skills](https://github.com/brianlan/improved-ai-agent/tree/master/skills/export-opencode-sessions). 
-
-Tested on OpenCode v1.4.3 on Windows.
+**tl;dr:** A simple CLI tool for managing [OpenCode](https://github.com/opencode-ai/opencode) sessions stored in SQLite. It handles renamed/removed project folders, allows exporting all conversations of a project in markdown format, and provides a way to even import raw jsons into database.
 
 > [!CAUTION]
 > 
 > This tool may manipulate your local OpenCode database. Use with caution, and make sure to backup your database before using this tool.
 
+## Why to use this tool / Features
+
+- Suppose you are working on a long conversation and want to *continue it on another machine*, but currently OpenCode does not support syncing conversations across multiple machines. The other machine will not have these conversations you had elsewhere. 
+   - You can use this tool to export the raw conversation to the project folder, sync it, and then re-import it on the other machine. Your conversations (and the whole project!) will be fully preserved and you can continue working smoothly.
+   - If you are working on both Windows and Mac machines, re-importing the conversations handles path issues smoothly, as all files are treated relative to the project root.
+- Suppose you moved your project folder to another location (or just renamed it for any reason), but OpenCode still has the old path in the database and won't recognize your new location. 
+   - You can use this tool to update the path in the OpenCode database and have all your conversations back.
+   - You can even *merge* multiple projects into one by "moving" the old project to the new path. Then you will see all your conversations in the merged project.
+   - The old project paths don't even have to exist when moving, since this is only manipulating the OpenCode database; you need to manually move any other files in the project.
+
+
+## Acknowledgments
+
+- Motivated by Issues [#11231](https://github.com/anomalyco/opencode/issues/11231), [#14292](https://github.com/anomalyco/opencode/issues/14292), [#19017](https://github.com/anomalyco/opencode/issues/19017) of OpenCode, and inspired by [BrianLan's export-opencode-sessions Skills](https://github.com/brianlan/improved-ai-agent/tree/master/skills/export-opencode-sessions). 
+
+- Works on OpenCode v1.14.17 on Windows and Mac.
+
 ## Using this tool
 
-### Installation
+### Installation 
+
+
+using `uv python`: 
 
 ```bash
 uv tool install .
@@ -71,7 +87,7 @@ Options for exporting:
 Default export path: 
 
 - `<project>/.opencode/conversations/` for markdown, and 
-- `<project>/.opencode/raw_conversations/` for raw JSON.
+- `<project>/.opencode/raw_conversations/` for raw JSON (supported by import).
 - If the default export path no longer exists, falls back to `cwd`.
 
 #### Importing
@@ -85,24 +101,34 @@ ocsm import project --from /path/to/proj --to-project /path/to/proj             
 ocsm import project --from /path/to/proj --to-project /path/to/proj --no-substitute-paths
 ```
 
+Import only accepts raw JSON files (exported with `--format raw`). If the target directory already has sessions, conflicting session IDs are skipped.
+
+> [!NOTE]
+> 
+> This tool uses a verbose but safe database manipulation pipeline which creates a backup *every time* you imported something:
+> 
+> 1. SQLite WAL checkpoint to flush all cached data
+> 2. Full database backup (timestamped `.bak` file)
+> 3. Import sessions (skips existing IDs, replaces `session.directory` and paths in the conversation by default)
+> 4. Tree integrity validation
+> 5. OpenCode runtime verification (`opencode db PRAGMA integrity_check`)
+> 6. Report results. 
+> 
+> The user must manually delete the backup file after checking the results, or your disk may be filled up with so many backups.
+
 #### Moving/Renaming a project folder
 
-**Move** a project (after renaming/moving the folder):
+**Move** a project (after renaming/moving the project folder):
 
 ```bash
 ocsm move project --from /old/path --to-project /new/path     # update all session paths in the database
 ```
 
-If the target directory already has sessions, conflicting session IDs are skipped (merged).
+> [!NOTE]
+> 
+> - The new path can either be a project existing or not in the database. The "move" command only manipulates the paths in the database, and does not move the project folder and the files.
+> - The safe pipeline is also used for this command.
 
-Import only accepts raw JSON files (exported with `--format raw`). The import pipeline is:
-
-1. SQLite WAL checkpoint to flush all cached data
-2. Full database backup (timestamped `.bak` file)
-3. Import sessions (skips existing IDs, replaces `session.directory` and paths in the conversation by default)
-4. Tree integrity validation
-5. OpenCode runtime verification (`opencode db PRAGMA integrity_check`)
-6. Report results — user must MANUALLY delete the backup file after this
 
 ### Use custom database path
 
