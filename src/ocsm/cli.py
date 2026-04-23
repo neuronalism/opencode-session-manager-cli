@@ -24,6 +24,8 @@ from ocsm.queries import (
     list_sessions,
     load_messages,
     load_raw_messages,
+    reset_project_id_to_global,
+    resolve_project,
     session_exists,
     substitute_paths,
     update_project_worktree,
@@ -95,6 +97,7 @@ def list_projects_cmd(ctx: typer.Context):
 def list_sessions_cmd(
     ctx: typer.Context,
     project: str = typer.Option(None, "--project", "-p", help="Filter by project directory"),
+    project_id: str = typer.Option(None, "--project-id", help="Filter by project ID"),
     flat: bool = typer.Option(False, "--flat", help="Include subagent sessions"),
     tree: bool = typer.Option(False, "--tree", help="Show sessions in tree structure"),
 ):
@@ -104,15 +107,28 @@ def list_sessions_cmd(
         raise typer.Exit(1)
     db_path = ctx.obj["db_path"]
     include_children = flat or tree
+
+    resolved = None
+    if project or project_id:
+        conn = get_connection(db_path)
+        try:
+            resolved = resolve_project(conn, project, project_id)
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(1)
+        finally:
+            conn.close()
+
     conn = get_connection(db_path)
     try:
-        rows = list_sessions(conn, project, include_children=include_children)
+        rows = list_sessions(conn, resolved, include_children=include_children)
     finally:
         conn.close()
     if not rows:
         msg = "No sessions found."
-        if project:
-            msg = f"No sessions found for project '{project}'."
+        label = project or project_id or resolved
+        if label:
+            msg = f"No sessions found for project '{label}'."
         console.print(msg)
         return
     if tree:
@@ -305,6 +321,7 @@ def _import_session_tree(
                 old_directory = session.get("directory")
 
             session["directory"] = new_directory
+            session["project_id"] = "global"
 
             insert_session(conn, session)
             insert_messages(conn, messages)
@@ -394,6 +411,7 @@ def _import_report(result: dict) -> None:
     """Print import results to console."""
     if result["imported"]:
         console.print(f"[green]Imported {len(result['imported'])} session(s):[/green]")
+        console.print("[dim]  project_id reset to 'global' — OpenCode will assign the correct ID on next startup[/dim]")
         for sid in result["imported"]:
             console.print(f"  {sid}")
     if result["skipped"]:
@@ -417,7 +435,8 @@ def _import_report(result: dict) -> None:
 @export_app.command("project")
 def export_project_cmd(
     ctx: typer.Context,
-    project: str = typer.Option(..., "--from", help="Project directory path"),
+    project: str = typer.Option(None, "--from", help="Project directory path"),
+    from_id: str = typer.Option(None, "--from-id", help="Project ID"),
     to: Path | None = typer.Option(None, "--to", help="Output directory"),
     to_project: Path | None = typer.Option(None, "--to-project", help="Output to project's .opencode dir"),
     fmt: str = typer.Option("markdown", "--format", "-f", help="Export format: markdown or raw"),
@@ -427,15 +446,19 @@ def export_project_cmd(
     tool_calls: str = typer.Option("info", "--tool-call", help="Tool call detail level: none, info, details"),
 ):
     """Export all sessions of a project."""
+    if not project and not from_id:
+        console.print("[red]Error:[/red] --from or --from-id must be provided.")
+        raise typer.Exit(1)
     if flat and tree:
         console.print("[red]Error:[/red] --flat and --tree are mutually exclusive.")
         raise typer.Exit(1)
     db_path = ctx.obj["db_path"]
     conn = get_connection(db_path)
     try:
-        rows = list_sessions(conn, project, include_children=flat or tree)
+        resolved = resolve_project(conn, project, from_id)
+        rows = list_sessions(conn, resolved, include_children=flat or tree)
         if not rows:
-            console.print(f"[red]Error:[/red] No sessions found for project '{project}'.")
+            console.print(f"[red]Error:[/red] No sessions found for project '{project or from_id}'.")
             raise typer.Exit(1)
         exported = _export_sessions(conn, rows, to=to, to_project=to_project, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls)
     finally:
@@ -448,11 +471,27 @@ def export_project_cmd(
 def import_session_cmd(
     ctx: typer.Context,
     json_file: Path = typer.Option(..., "--from", help="Path to raw JSON file"),
-    to_project: Path = typer.Option(..., "--to-project", help="Local project directory to map to"),
+    to_project: Path | None = typer.Option(None, "--to-project", help="Local project directory to map to"),
+    to_project_id: str | None = typer.Option(None, "--to-project-id", help="Project ID to map to"),
     substitute_paths_flag: bool = typer.Option(True, "--substitute-paths/--no-substitute-paths", help="Replace old paths in data fields"),
 ):
     """Import a session (and its subagent tree) from a raw JSON file."""
+    if not to_project and not to_project_id:
+        console.print("[red]Error:[/red] --to-project or --to-project-id must be provided.")
+        raise typer.Exit(1)
     db_path = ctx.obj["db_path"]
+
+    # Resolve target project
+    if to_project_id:
+        conn = get_connection(db_path)
+        try:
+            resolved_dir = resolve_project(conn, project_id=to_project_id)
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(1)
+        finally:
+            conn.close()
+        to_project = Path(resolved_dir)
 
     try:
         data = _load_raw_file(json_file)
@@ -487,11 +526,27 @@ def import_session_cmd(
 def import_project_cmd(
     ctx: typer.Context,
     from_dir: Path = typer.Option(..., "--from", help="Source project directory"),
-    to_project: Path = typer.Option(..., "--to-project", help="Local project directory to map to"),
+    to_project: Path | None = typer.Option(None, "--to-project", help="Local project directory to map to"),
+    to_project_id: str | None = typer.Option(None, "--to-project-id", help="Project ID to map to"),
     substitute_paths_flag: bool = typer.Option(True, "--substitute-paths/--no-substitute-paths", help="Replace old paths in data fields"),
 ):
     """Import all sessions from a project's raw export directory."""
+    if not to_project and not to_project_id:
+        console.print("[red]Error:[/red] --to-project or --to-project-id must be provided.")
+        raise typer.Exit(1)
     db_path = ctx.obj["db_path"]
+
+    # Resolve target project
+    if to_project_id:
+        conn = get_connection(db_path)
+        try:
+            resolved_dir = resolve_project(conn, project_id=to_project_id)
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(1)
+        finally:
+            conn.close()
+        to_project = Path(resolved_dir)
 
     raw_dir = from_dir / ".opencode" / "raw_conversations"
     if not raw_dir.is_dir():
@@ -555,13 +610,30 @@ def import_project_cmd(
 @move_app.command("project")
 def move_project_cmd(
     ctx: typer.Context,
-    from_dir: Path = typer.Option(..., "--from", help="Original project directory path"),
-    to_project: Path = typer.Option(..., "--to-project", help="New project directory path"),
+    from_dir: Path | None = typer.Option(None, "--from", help="Original project directory path"),
+    from_id: str | None = typer.Option(None, "--from-id", help="Original project ID"),
+    to_project: Path | None = typer.Option(None, "--to-project", help="New project directory path"),
+    to_id: str | None = typer.Option(None, "--to-id", help="New project ID"),
 ):
     """Move all sessions from one project directory to another."""
+    if not from_dir and not from_id:
+        console.print("[red]Error:[/red] --from or --from-id must be provided.")
+        raise typer.Exit(1)
+    if not to_project and not to_id:
+        console.print("[red]Error:[/red] --to-project or --to-id must be provided.")
+        raise typer.Exit(1)
     db_path = ctx.obj["db_path"]
-    old_path = str(from_dir.expanduser().resolve())
-    new_path = str(to_project.expanduser().resolve())
+
+    # Resolve source and target
+    conn = get_connection(db_path)
+    try:
+        old_path = resolve_project(conn, str(from_dir) if from_dir else None, from_id)
+        new_path = resolve_project(conn, str(to_project) if to_project else None, to_id)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+    finally:
+        conn.close()
 
     if old_path == new_path:
         console.print("[yellow]Source and destination paths are the same. Nothing to do.[/yellow]")
@@ -607,6 +679,7 @@ def move_project_cmd(
         conn.execute("BEGIN")
         dir_updated = update_session_directory(conn, session_ids, old_path, new_path)
         project_updated = update_project_worktree(conn, old_path, new_path)
+        pid_reset = reset_project_id_to_global(conn, session_ids)
         path_sub_counts = substitute_paths(conn, session_ids, old_path, new_path)
         conn.commit()
     except Exception:
@@ -623,6 +696,8 @@ def move_project_cmd(
         for sid in skipped_ids:
             console.print(f"  {sid}")
     console.print(f"  session.directory updated: {dir_updated} row(s)")
+    if pid_reset:
+        console.print(f"  session.project_id reset to 'global': {pid_reset} row(s) [dim]— OpenCode will assign the correct ID on next startup[/dim]")
     if project_updated:
         console.print(f"  project.worktree updated: {project_updated} row(s)")
     total_data = sum(path_sub_counts.values())

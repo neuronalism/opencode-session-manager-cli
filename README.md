@@ -21,7 +21,7 @@
 
 - Motivated by Issues [#11231](https://github.com/anomalyco/opencode/issues/11231), [#14292](https://github.com/anomalyco/opencode/issues/14292), [#19017](https://github.com/anomalyco/opencode/issues/19017) of OpenCode, and inspired by [BrianLan's export-opencode-sessions Skills](https://github.com/brianlan/improved-ai-agent/tree/master/skills/export-opencode-sessions). 
 
-- Works on OpenCode v1.14.17 on Windows and Mac.
+- Works on OpenCode v1.14.22 on Windows and Mac.
 
 ## Using this tool
 
@@ -43,10 +43,13 @@ uv tool install .
 ```bash
 ocsm list project                        # list all projects
 ocsm list session                        # list root sessions
-ocsm list session --project <path>       # filter by project
+ocsm list session --project <path>       # filter by project directory
+ocsm list session --project-id <id>      # filter by project ID (not recommended)
 ocsm list session --flat                 # include subagent sessions (flat)
 ocsm list session --tree                 # include subagent sessions (tree)
 ```
+
+
 
 #### Exporting
 
@@ -65,10 +68,14 @@ ocsm export session --from <ses_id> --to-project /path/to/proj   # output to <pr
 
 ```bash
 ocsm export project --from /path/to/proj                            # export all top-level sessions of a project
+ocsm export project --from-id <project_id>                          # export by project ID (not recommended)
 ocsm export project --from /path/to/proj --format raw               # raw JSON
 ocsm export project --from /path/to/proj --tree                     # with subagents
 ocsm export project --from /path/to/proj --flat                     # with subagents (flat)
 ```
+> [!NOTE]
+>
+> Using `--project-id` is not recommended because OpenCode derives project IDs from the *git* root commit hash. Non-git projects all share the ID `'global'`, making it non-unique. Prefer `--project` with a directory path instead.
 
 Options for exporting:
 
@@ -84,9 +91,9 @@ Options for exporting:
 --flat                               # subagent sessions in same directory
 ```
 
-Default export path: 
+Default export path:
 
-- `<project>/.opencode/conversations/` for markdown, and 
+- `<project>/.opencode/conversations/` for markdown, and
 - `<project>/.opencode/raw_conversations/` for raw JSON (supported by import).
 - If the default export path no longer exists, falls back to `cwd`.
 
@@ -96,12 +103,18 @@ Default export path:
 
 ```bash
 ocsm import session --from /path/to/session.json --to-project /path/to/proj        # import one session tree
+ocsm import session --from /path/to/session.json --to-project-id <id>              # import to project by ID (not recommended)
 ocsm import session --from /path/to/session.json --to-project /path/to/proj --no-substitute-paths  # import without replacing paths in the conversations
 ocsm import project --from /path/to/proj --to-project /path/to/proj                # import all sessions from a project's raw export
+ocsm import project --from /path/to/proj --to-project-id <id>                      # import to project by ID (not recommended)
 ocsm import project --from /path/to/proj --to-project /path/to/proj --no-substitute-paths
 ```
 
 Import only accepts raw JSON files (exported with `--format raw`). If the target directory already has sessions, conflicting session IDs are skipped.
+
+> [!NOTE]
+>
+> Imported sessions have their `project_id` reset to `'global'`. OpenCode will automatically assign the correct project ID (derived from the git root commit hash) the next time you open the project. For non-git projects, `'global'` is the expected ID.
 
 > [!NOTE]
 > 
@@ -122,12 +135,14 @@ Import only accepts raw JSON files (exported with `--format raw`). If the target
 
 ```bash
 ocsm move project --from /old/path --to-project /new/path     # update all session paths in the database
+ocsm move project --from-id <id> --to-id <id>                 # move by project ID
 ```
 
 > [!NOTE]
-> 
+>
 > - The new path can either be a project existing or not in the database. The "move" command only manipulates the paths in the database, and does not move the project folder and the files.
 > - The safe pipeline is also used for this command.
+> - Moved sessions have their `project_id` reset to `'global'`. OpenCode will automatically assign the correct project ID (derived from the git root commit hash) the next time you open the project. For non-git projects, `'global'` is the expected ID.
 
 
 ### Use custom database path
@@ -142,6 +157,7 @@ ocsm move project --from /old/path --to-project /new/path     # update all sessi
 - [x] export sessions and projects
 - [x] import raw jsons into database
 - [x] move project paths (after rename/relocate)
+- [x] support --project-id as alternative to --project (path)
 - [ ] sync conversations in two ways with local project folder
 
 ## License

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+from pathlib import Path
+
 from rich.text import Text
 
 
@@ -19,7 +21,8 @@ def format_projects_list(rows: list) -> Text:
     parts: list[Text] = []
     for row in rows:
         block = Text()
-        block.append(f"  {row['project_id']}\n", style="bold cyan")
+        name = row["project_name"] or Path(row["directory"]).name
+        block.append(f"  {name}\n", style="bold cyan")
         block.append(f"    {format_timestamp(row['latest_updated'])}\n", style="dim")
         block.append(f"    {row['directory']}\n")
         block.append(f"    {row['session_count']} sessions\n", style="dim")

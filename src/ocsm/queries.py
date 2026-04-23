@@ -2,18 +2,53 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
+
+
+def resolve_project(
+    conn: sqlite3.Connection,
+    project: str | None = None,
+    project_id: str | None = None,
+) -> str:
+    """Resolve a project identifier to a directory path.
+
+    - project_id: look up project table (id → worktree), then session table (project_id → directory)
+    - project: resolve as filesystem path
+    - exactly one must be provided
+    """
+    if not project and not project_id:
+        raise ValueError("Either --project or --project-id must be provided")
+    if project and project_id:
+        raise ValueError("--project and --project-id are mutually exclusive")
+
+    if project_id:
+        # Try project table first
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "project" in tables:
+            row = conn.execute("SELECT worktree FROM project WHERE id = ?", (project_id,)).fetchone()
+            if row:
+                return row["worktree"]
+        # Fallback to session table
+        row = conn.execute("SELECT directory FROM session WHERE project_id = ? LIMIT 1", (project_id,)).fetchone()
+        if row:
+            return row["directory"]
+        raise ValueError(f"No project found with id '{project_id}'")
+
+    return str(Path(project).expanduser().resolve())
 
 
 def list_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         """
         SELECT
-            directory,
-            project_id,
+            s.directory,
+            s.project_id,
+            p.name as project_name,
             COUNT(*) as session_count,
-            MAX(time_updated) as latest_updated
-        FROM session
-        GROUP BY directory, project_id
+            MAX(s.time_updated) as latest_updated
+        FROM session s
+        LEFT JOIN project p ON p.worktree = s.directory
+        GROUP BY s.directory, s.project_id
         ORDER BY latest_updated DESC
         """
     ).fetchall()
@@ -341,5 +376,22 @@ def update_project_worktree(conn: sqlite3.Connection, old_path: str, new_path: s
     cursor = conn.execute(
         "UPDATE project SET worktree = ? WHERE worktree = ?",
         [new_path, old_path],
+    )
+    return cursor.rowcount
+
+
+def reset_project_id_to_global(
+    conn: sqlite3.Connection, session_ids: list[str]
+) -> int:
+    """Reset project_id to 'global' for the given sessions.
+
+    Used during move/import so OpenCode can re-assign the correct ID on startup.
+    """
+    if not session_ids:
+        return 0
+    placeholders = ", ".join(["?"] * len(session_ids))
+    cursor = conn.execute(
+        f"UPDATE session SET project_id = 'global' WHERE id IN ({placeholders})",
+        session_ids,
     )
     return cursor.rowcount
