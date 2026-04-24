@@ -23,6 +23,7 @@ def format_projects_list(rows: list) -> Text:
         block = Text()
         name = row["project_name"] or Path(row["directory"]).name
         block.append(f"  {name}\n", style="bold cyan")
+        block.append(f"    ID: {row['project_id']}\n", style="dim")
         block.append(f"    {format_timestamp(row['latest_updated'])}\n", style="dim")
         block.append(f"    {row['directory']}\n")
         block.append(f"    {row['session_count']} sessions\n", style="dim")
@@ -52,8 +53,9 @@ def format_sessions_tree(rows: list) -> Text:
     def render_node(row: dict, indent: str) -> Text:
         t = Text()
         t.append(f"{indent}- ", style="bold")
-        t.append(f"{row['id']}\n", style="bold cyan")
-        t.append(f"{indent}  {row['title'] or '(untitled)'}\n")
+        title = row["title"] or "(untitled)"
+        t.append(f"{title}\n", style="bold cyan")
+        t.append(f"{indent}  ID: {row['id']}\n", style="dim")
         t.append(f"{indent}  {format_timestamp(row['time_updated'])}\n", style="dim")
         t.append(f"{indent}  {row['directory']}\n")
         for child in children_map.get(row["id"], []):
@@ -72,9 +74,9 @@ def format_sessions_list(rows: list) -> Text:
     parts: list[Text] = []
     for row in rows:
         block = Text()
-        block.append(f"  {row['id']}\n", style="bold cyan")
         title = row["title"] or "(untitled)"
-        block.append(f"    {title}\n")
+        block.append(f"  {title}\n", style="bold cyan")
+        block.append(f"    ID: {row['id']}\n", style="dim")
         block.append(f"    {format_timestamp(row['time_updated'])}\n", style="dim")
         block.append(f"    {row['directory']}\n")
         parts.append(block)

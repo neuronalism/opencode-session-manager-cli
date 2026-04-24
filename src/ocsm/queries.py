@@ -2,39 +2,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from pathlib import Path
-
-
-def resolve_project(
-    conn: sqlite3.Connection,
-    project: str | None = None,
-    project_id: str | None = None,
-) -> str:
-    """Resolve a project identifier to a directory path.
-
-    - project_id: look up project table (id → worktree), then session table (project_id → directory)
-    - project: resolve as filesystem path
-    - exactly one must be provided
-    """
-    if not project and not project_id:
-        raise ValueError("Either --project or --project-id must be provided")
-    if project and project_id:
-        raise ValueError("--project and --project-id are mutually exclusive")
-
-    if project_id:
-        # Try project table first
-        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        if "project" in tables:
-            row = conn.execute("SELECT worktree FROM project WHERE id = ?", (project_id,)).fetchone()
-            if row:
-                return row["worktree"]
-        # Fallback to session table
-        row = conn.execute("SELECT directory FROM session WHERE project_id = ? LIMIT 1", (project_id,)).fetchone()
-        if row:
-            return row["directory"]
-        raise ValueError(f"No project found with id '{project_id}'")
-
-    return str(Path(project).expanduser().resolve())
 
 
 def list_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
