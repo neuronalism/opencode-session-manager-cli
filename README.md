@@ -16,12 +16,11 @@
    - You can even *merge* multiple projects into one by "moving" the old project to the new path. Then you will see all your conversations in the merged project.
    - The old project paths don't even have to exist when moving, since this is only manipulating the OpenCode database; you need to manually move any other files in the project.
 
-
 ## Acknowledgments
 
 - Motivated by Issues [#11231](https://github.com/anomalyco/opencode/issues/11231), [#14292](https://github.com/anomalyco/opencode/issues/14292), [#19017](https://github.com/anomalyco/opencode/issues/19017) of OpenCode, and inspired by [BrianLan's export-opencode-sessions Skills](https://github.com/brianlan/improved-ai-agent/tree/master/skills/export-opencode-sessions). 
 
-- Works on OpenCode v1.14.22 on Windows and Mac.
+- Works on OpenCode v1.14.33 on Windows and Mac.
 
 ## Using this tool
 
