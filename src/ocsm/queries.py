@@ -2,6 +2,32 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
+
+
+def _normalize_directory(path: str) -> str:
+    """Normalize a directory path for cross-platform comparison.
+
+    OpenCode stores project paths with forward slashes even on Windows
+    (e.g. ``D:/Documents/proj``), but ``Path.resolve()`` on Windows returns
+    backslashes (``D:\\Documents\\proj``). Comparing these verbatim fails.
+    We normalize both sides to forward slashes, lower-cased drive letters, so
+    a session's ``directory`` column matches regardless of which form the
+    caller passed in. Case sensitivity outside the drive letter is preserved
+    (project folder names can differ only by case).
+    """
+    p = Path(path).expanduser()
+    # Resolve without requiring the path to exist on disk (opencode may point at a
+    # folder that was moved/deleted). Use absolute() so a relative input is still
+    # anchored, but avoid resolve() which forces OS-native separators.
+    if not p.is_absolute():
+        p = (Path.cwd() / p)
+    s = str(p)
+    norm = s.replace("\\", "/")
+    # Normalize drive letter casing (Windows): "D:/" vs "d:/"
+    if len(norm) >= 2 and norm[1] == ":":
+        norm = norm[0].upper() + norm[1:]
+    return norm
 
 
 def list_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -29,13 +55,17 @@ def list_sessions(
     if not include_children:
         where = "WHERE parent_id IS NULL"
     if project:
+        # Normalize both the stored value and the candidate to forward slashes so a
+        # session stored as 'D:/Documents/proj' matches a candidate resolved to
+        # 'D:\\Documents\\proj'. Also fall back to the raw candidate string.
         resolved = str(__import__("pathlib").Path(project).expanduser().resolve())
+        normalized = _normalize_directory(project)
         if where:
             where += " AND"
         else:
             where = "WHERE"
-        where += " (directory = ? OR directory = ?)"
-        params = [resolved, project]
+        where += " (REPLACE(directory, '\\', '/') = ? OR directory = ? OR directory = ?)"
+        params = [normalized, resolved, project]
     return conn.execute(
         f"""
         SELECT * FROM session
@@ -51,6 +81,26 @@ def get_session(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row | None
         "SELECT * FROM session WHERE id = ?",
         (session_id,),
     ).fetchone()
+
+
+def get_session_timestamps(conn: sqlite3.Connection, directory: str) -> dict[str, int]:
+    """Return {session_id: time_updated} for all sessions in a project directory.
+
+    Matching mirrors list_sessions(): forward-slash normalization handles the
+    OpenCode-on-Windows storage style (forward slashes) vs Path.resolve() output
+    (backslashes). Used to build the DB-side index for sync diffing without
+    loading full message/part rows.
+    """
+    resolved = str(Path(directory).expanduser().resolve())
+    normalized = _normalize_directory(directory)
+    rows = conn.execute(
+        """
+        SELECT id, time_updated FROM session
+        WHERE REPLACE(directory, '\\', '/') = ? OR directory = ? OR directory = ?
+        """,
+        (normalized, resolved, directory),
+    ).fetchall()
+    return {row["id"]: row["time_updated"] for row in rows}
 
 
 def session_info(row: sqlite3.Row) -> dict:
@@ -362,3 +412,39 @@ def reset_project_id_to_global(
         session_ids,
     )
     return cursor.rowcount
+
+
+def delete_session_tree(conn: sqlite3.Connection, session_ids: list[str]) -> int:
+    """Delete the part / message / session rows for the given session IDs.
+
+    Used by sync for (a) replacing an existing session in place (DELETE + INSERT)
+    and (b) propagating deletions to the DB side.  Caller passes the full id set
+    (root + descendants) so whole trees can be removed without leaving orphans.
+    Returns the number of session rows deleted.
+    """
+    if not session_ids:
+        return 0
+    placeholders = ", ".join(["?"] * len(session_ids))
+    conn.execute(f"DELETE FROM part WHERE session_id IN ({placeholders})", session_ids)
+    conn.execute(f"DELETE FROM message WHERE session_id IN ({placeholders})", session_ids)
+    cursor = conn.execute(f"DELETE FROM session WHERE id IN ({placeholders})", session_ids)
+    return cursor.rowcount
+
+
+def replace_session(
+    conn: sqlite3.Connection,
+    session_dict: dict,
+    messages: list[dict],
+    parts: list[dict],
+) -> None:
+    """Replace a session (and its messages/parts) in place: DELETE then INSERT.
+
+    Distinct from insert_session(): the latter is used by `import` which skips
+    existing IDs.  Sync needs to overwrite when the folder copy is newer, so we
+    delete the existing rows first (if any) and re-insert.  Safe to call when no
+    prior row exists — delete_session_tree() is a no-op on an empty set.
+    """
+    delete_session_tree(conn, [session_dict["id"]])
+    insert_session(conn, session_dict)
+    insert_messages(conn, messages)
+    insert_parts(conn, parts, messages=messages)

@@ -115,6 +115,53 @@ Import only accepts raw JSON files (exported with `--format raw`). If the target
 > 
 > The user must manually delete the backup file after checking the results, or your disk may be filled up with so many backups.
 
+#### Syncing
+
+`sync project` reconciles a project's conversations **both ways** between the OpenCode database and the project's `.opencode/raw_conversations/` folder. Once that folder is kept in sync across machines (git, cloud drive, …), running `sync` on each machine keeps the local DB consistent with it in **both** directions — no manual export/import round-trip.
+
+The simplest way to keep a project portable:
+
+```bash
+# on machine A
+ocsm sync project --from /path/to/proj      # writes DB sessions into the folder
+# git push / cloud-sync the project folder
+# on machine B (after git pull)
+ocsm sync project --from /path/to/proj      # pulls new folder sessions into the local DB
+```
+
+**Common usage:**
+
+```bash
+ocsm sync project --from /path/to/proj                  # default: prompt on conflicts, deletions on
+ocsm sync project --from /path/to/proj --dry-run        # preview the plan, write nothing
+ocsm sync project --from /path/to/proj --on-conflict newer   # auto-resolve: newer time_updated wins
+ocsm sync project --from /path/to/proj --on-conflict skip    # skip conflicting sessions
+ocsm sync project --from /path/to/proj --no-delete      # turn off deletion propagation
+ocsm sync project --from /path/to/proj -y               # non-interactive: skip confirmations
+```
+
+Full option list: `--on-conflict {ask,newer,skip}`, `--delete/--no-delete`, `--yes/-y`, `--dry-run`, `--substitute-paths/--no-substitute-paths`.
+
+**How it works**
+
+- **Three states are compared**: the DB (sessions whose `directory` matches the project), the folder (`<project>/.opencode/raw_conversations/*.json`), and the *manifest* (`<project>/.opencode/.ocsm-sync.json`, written by `sync` after every successful run).
+- **Identity & freshness**: sessions are matched by `id`; which copy is newer is decided by `time_updated`, read from the raw JSON's `session` object (not the file mtime — stable across OSes and clocks).
+- **Classification**:
+  - only on one side → copied to the other;
+  - on both sides, same `time_updated` → no-op;
+  - on both sides, different `time_updated` → **conflict**;
+  - tracked by the manifest but missing from one side → **deletion**.
+- **Conflicts** are resolved by `--on-conflict`:
+  - `ask` (default): per-session prompt — *keep DB / keep folder / skip* — like a file-copy dialog. Needs a TTY; in a non-interactive shell it aborts with an error rather than silently overwriting (use `newer`/`skip` to run unattended).
+  - `newer`: the copy with the larger `time_updated` wins (tie → skip).
+  - `skip`: leave both copies untouched.
+- **Deletion propagation**: if a session the manifest remembers later vanishes from one side, `sync` removes it from the other. **The first sync (no manifest) never deletes** — every session is treated as new; deleting the manifest resets to that safe behavior. Deletions are whole-tree (removing a root session removes its subagents) and are confirmed interactively (default `N`) unless `-y` is given.
+- **Safety**: DB writes reuse the same pipeline as `import` — WAL checkpoint + timestamped `.bak` backup + single transaction with rollback. Updating an existing session is done as DELETE + INSERT (its messages/parts may have changed). Imported `project_id` is reset to `global` so OpenCode reassigns it on startup.
+- **No content merge**: a session is always taken wholesale from one side — `sync` never merges messages field-by-field.
+
+> [!NOTE]
+> Subagent sessions (children of a root session) follow their root's direction, so conversation trees stay intact across syncs.
+
 #### Moving/Renaming a project folder
 
 **Move** a project (after renaming/moving the project folder):
@@ -141,7 +188,7 @@ ocsm move project --from-id <id> --to-id <id>                 # move by project 
 - [x] export sessions and projects
 - [x] import raw jsons into database
 - [x] move project paths (after rename/relocate)
-- [ ] sync conversations in two ways with local project folder
+- [x] sync conversations in two ways with local project folder
 
 ## License
 
