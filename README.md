@@ -16,11 +16,28 @@
    - You can even *merge* multiple projects into one by "moving" the old project to the new path. Then you will see all your conversations in the merged project.
    - The old project paths don't even have to exist when moving, since this is only manipulating the OpenCode database; you need to manually move any other files in the project.
 
+## How this compares to OpenCode's built-in export/import
+
+OpenCode now ships its own `opencode export [sessionID]` and `opencode import <file>` commands. This tool exists to fill the gaps they leave.
+
+**What OpenCode's built-in commands do:**
+- `opencode export <sessionID>` exports a **single session** as JSON to stdout (its `info` + `messages`).
+- `opencode import <file>` imports that single session back into the database.
+
+**What this tool adds on top:**
+
+- **Full conversation trees.** OpenCode's `export` only emits the one session you name. Its subagent sessions (the `@explore`/`task` children a conversation spawns) are **not** exported — their IDs only appear as strings inside a parent's tool-call metadata. Re-importing such an export therefore **loses every subagent session permanently**. This tool exports and imports the **entire tree** (root + all descendants), so a multi-agent conversation round-trips intact.
+- **Batch operations.** `export project` / `import project` work on every session of a project at once, instead of one session at a time.
+- **Two-way sync.** `sync project` reconciles the database and the project folder in both directions (new / updated / deleted), with conflict resolution and deletion propagation — none of which the built-in commands offer.
+- **Cross-machine path handling.** Imported sessions get their absolute paths rewritten to the local project directory (handling Windows ↔ Mac differences automatically); the built-in import keeps the exporting machine's paths.
+- **No runtime dependency.** This tool talks to the SQLite database directly (`--db <path>`), so it works even when the `opencode` CLI itself can't run, and can target any database file.
+- **Safe writes.** Every database mutation goes through a WAL checkpoint + timestamped backup + single transaction with rollback.
+
 ## Acknowledgments
 
 - Motivated by Issues [#11231](https://github.com/anomalyco/opencode/issues/11231), [#14292](https://github.com/anomalyco/opencode/issues/14292), [#19017](https://github.com/anomalyco/opencode/issues/19017) of OpenCode, and inspired by [BrianLan's export-opencode-sessions Skills](https://github.com/brianlan/improved-ai-agent/tree/master/skills/export-opencode-sessions). 
 
-- Works on OpenCode v1.14.33 on Windows and Mac.
+- Works on OpenCode v1.17.7 on Windows and Mac.
 
 ## Using this tool
 
