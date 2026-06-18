@@ -1,6 +1,13 @@
 # OpenCode Session Manager CLI
 
-**tl;dr:** A simple CLI tool for managing [OpenCode](https://github.com/opencode-ai/opencode) sessions stored in SQLite. It handles renamed/removed project folders, allows exporting all conversations of a project in markdown format, and provides a way to even import raw jsons into database.
+**tl;dr:** 
+A simple CLI tool for managing [OpenCode](https://github.com/opencode-ai/opencode) projects and sessions stored in SQLite. It can:
+- handle renamed/removed project folders,
+- batch export all sessions (with sub-sessions) of a project as markdown or raw JSON,
+- import raw JSON sessions (with sub-sessions) into the database, and 
+- sync project-stored JSON sessions with the local database, allowing cross-device project synchronization.
+
+Tested on OpenCode v1.17.8 on Windows and Mac.
 
 > [!CAUTION]
 > 
@@ -16,7 +23,7 @@
    - You can even *merge* multiple projects into one by "moving" the old project to the new path. Then you will see all your conversations in the merged project.
    - The old project paths don't even have to exist when moving, since this is only manipulating the OpenCode database; you need to manually move any other files in the project.
 
-## How this compares to OpenCode's built-in export/import
+## Comparison to OpenCode's built-in export/import
 
 OpenCode now ships its own `opencode export [sessionID]` and `opencode import <file>` commands. This tool exists to fill the gaps they leave.
 
@@ -26,7 +33,7 @@ OpenCode now ships its own `opencode export [sessionID]` and `opencode import <f
 
 **What this tool adds on top:**
 
-- **Full conversation trees.** OpenCode's `export` only emits the one session you name. Its subagent sessions (the `@explore`/`task` children a conversation spawns) are **not** exported — their IDs only appear as strings inside a parent's tool-call metadata. Re-importing such an export therefore **loses every subagent session permanently**. This tool exports and imports the **entire tree** (root + all descendants), so a multi-agent conversation round-trips intact.
+- **Full conversation trees.** OpenCode's `export` only emits the one session you name (as of version 1.17.7). Its subagent sessions are **not** exported — their IDs only appear as strings inside a parent's tool-call metadata. Re-importing such an export therefore **loses every subagent session permanently**. This tool exports and imports the **entire tree** (root + all descendants), so a multi-agent conversation round-trips intact.
 - **Batch operations.** `export project` / `import project` work on every session of a project at once, instead of one session at a time.
 - **Two-way sync.** `sync project` reconciles the database and the project folder in both directions (new / updated / deleted), with conflict resolution and deletion propagation — none of which the built-in commands offer.
 - **Cross-machine path handling.** Imported sessions get their absolute paths rewritten to the local project directory (handling Windows ↔ Mac differences automatically); the built-in import keeps the exporting machine's paths.
@@ -37,7 +44,6 @@ OpenCode now ships its own `opencode export [sessionID]` and `opencode import <f
 
 - Motivated by Issues [#11231](https://github.com/anomalyco/opencode/issues/11231), [#14292](https://github.com/anomalyco/opencode/issues/14292), [#19017](https://github.com/anomalyco/opencode/issues/19017) of OpenCode, and inspired by [BrianLan's export-opencode-sessions Skills](https://github.com/brianlan/improved-ai-agent/tree/master/skills/export-opencode-sessions). 
 
-- Works on OpenCode v1.17.7 on Windows and Mac.
 
 ## Using this tool
 
