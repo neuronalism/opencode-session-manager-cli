@@ -30,6 +30,37 @@ def _normalize_directory(path: str) -> str:
     return norm
 
 
+def opencode_paths(to_project: Path) -> tuple[str, str]:
+    """Return ``(directory, path)`` for a target project in OpenCode's storage convention.
+
+    OpenCode stores two related columns per session:
+
+    - ``directory``: the absolute project path, **forward slashes**, upper-cased
+      Windows drive letter — e.g. ``D:/Documents/foo``. ``Path.resolve()`` on Windows
+      yields backslashes (``D:\\Documents\\foo``), which OpenCode will NOT match, so
+      imported sessions become invisible/unopenable. This normalizes to the form
+      OpenCode itself writes.
+    - ``path``: the same path with the leading drive/root stripped — e.g.
+      ``Documents/foo``. It is the structural counterpart of ``directory`` and must be
+      recomputed on import (a source export from another machine carries that machine's
+      ``path``, e.g. ``Users/shengw/Documents/foo``), not copied verbatim.
+
+    Both are recomputed unconditionally on import/sync, mirroring how ``directory`` is
+    already rewritten. User-facing path text inside ``message``/``part.data`` is handled
+    separately by :func:`substitute_paths` (prefix replacement).
+    """
+    resolved = str(to_project.expanduser().resolve())
+    directory = resolved.replace("\\", "/")
+    if len(directory) >= 2 and directory[1] == ":":
+        directory = directory[0].upper() + directory[1:]
+    path = directory
+    if len(path) >= 3 and path[1] == ":":
+        path = path[3:]          # drop 'D:/'
+    elif path.startswith("/"):
+        path = path[1:]          # drop leading '/' (posix absolute)
+    return directory, path
+
+
 def list_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         """
@@ -101,45 +132,6 @@ def get_session_timestamps(conn: sqlite3.Connection, directory: str) -> dict[str
         (normalized, resolved, directory),
     ).fetchall()
     return {row["id"]: row["time_updated"] for row in rows}
-
-
-def session_info(row: sqlite3.Row) -> dict:
-    out: dict = {
-        "id": row["id"],
-        "slug": row["slug"],
-        "projectID": row["project_id"],
-        "workspaceID": row["workspace_id"],
-        "directory": row["directory"],
-        "parentID": row["parent_id"],
-        "title": row["title"],
-        "version": row["version"],
-        "time": {
-            "created": row["time_created"],
-            "updated": row["time_updated"],
-            "compacting": row["time_compacting"],
-            "archived": row["time_archived"],
-        },
-    }
-    if row["share_url"]:
-        out["share"] = {"url": row["share_url"]}
-    if row["summary_additions"] is not None or row["summary_deletions"] is not None or row["summary_files"] is not None:
-        out["summary"] = {
-            "additions": row["summary_additions"] or 0,
-            "deletions": row["summary_deletions"] or 0,
-            "files": row["summary_files"] or 0,
-            "diffs": json.loads(row["summary_diffs"]) if row["summary_diffs"] else None,
-        }
-    if row["revert"]:
-        out["revert"] = json.loads(row["revert"])
-    if row["permission"]:
-        out["permission"] = json.loads(row["permission"])
-    for key in ("workspaceID", "parentID"):
-        if out[key] is None:
-            out.pop(key)
-    for key in ("compacting", "archived"):
-        if out["time"][key] is None:
-            out["time"].pop(key)
-    return out
 
 
 def load_messages(conn: sqlite3.Connection, session_id: str) -> list:
@@ -233,12 +225,22 @@ def get_session_tree(conn: sqlite3.Connection, session_id: str) -> list[sqlite3.
 
 # --- Import functions ---
 
+# Full column list of the `session` table, in schema order (PRAGMA table_info).
+# Kept complete so import/export round-trip preserves every field OpenCode stores;
+# a stale subset here previously dropped `path`/`agent`/`model`/`tokens_*`/etc., which
+# left imported sessions unopenable in the OpenCode UI. `insert_session` only writes
+# keys that are actually present in the source dict, so older exports missing the
+# newer columns still import cleanly (DB defaults fill them).
 SESSION_COLUMNS = [
     "id", "project_id", "parent_id", "slug", "directory", "title", "version",
     "share_url", "summary_additions", "summary_deletions", "summary_files",
     "summary_diffs", "revert", "permission",
     "time_created", "time_updated", "time_compacting", "time_archived",
     "workspace_id",
+    "path", "agent", "model", "cost",
+    "tokens_input", "tokens_output", "tokens_reasoning",
+    "tokens_cache_read", "tokens_cache_write",
+    "metadata",
 ]
 
 MESSAGE_COLUMNS = ["id", "session_id", "time_created", "time_updated", "data"]
@@ -421,12 +423,59 @@ def delete_session_tree(conn: sqlite3.Connection, session_ids: list[str]) -> int
     and (b) propagating deletions to the DB side.  Caller passes the full id set
     (root + descendants) so whole trees can be removed without leaving orphans.
     Returns the number of session rows deleted.
+
+    NOTE: this intentionally leaves dependent rows (todo, session_message, ...)
+    untouched, because ``replace_session`` re-inserts the same id and those rows
+    must survive the in-place replace.  For *permanent* removal use
+    ``delete_session_tree_full`` instead.
     """
     if not session_ids:
         return 0
     placeholders = ", ".join(["?"] * len(session_ids))
     conn.execute(f"DELETE FROM part WHERE session_id IN ({placeholders})", session_ids)
     conn.execute(f"DELETE FROM message WHERE session_id IN ({placeholders})", session_ids)
+    cursor = conn.execute(f"DELETE FROM session WHERE id IN ({placeholders})", session_ids)
+    return cursor.rowcount
+
+
+# Dependent tables (besides part/message/session) that reference session.id.
+# ``PRAGMA foreign_keys`` is OFF on every ocsm connection, so the schema's declared
+# ``ON DELETE CASCADE`` never fires here; permanent removal must clean these by hand.
+_SESSION_DEPENDENT_TABLES = (
+    "todo",
+    "session_message",
+    "session_input",
+    "session_share",
+    "session_context_epoch",
+)
+
+
+def delete_session_tree_full(conn: sqlite3.Connection, session_ids: list[str]) -> int:
+    """Permanently delete sessions and *all* dependent rows across the schema.
+
+    Unlike :func:`delete_session_tree` (which is used for in-place replace and
+    deliberately preserves dependent rows), this wipes every table that
+    references ``session.id`` so no orphaned rows are left behind. Safe to call
+    on DBs missing some of the dependent tables: each is table-existence-guarded.
+
+    Caller must pass the full id set (root + descendants); deletion order is
+    child-first so nothing violates referential integrity. Returns the number of
+    ``session`` rows deleted.
+    """
+    if not session_ids:
+        return 0
+    placeholders = ", ".join(["?"] * len(session_ids))
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    conn.execute(f"DELETE FROM part WHERE session_id IN ({placeholders})", session_ids)
+    conn.execute(f"DELETE FROM message WHERE session_id IN ({placeholders})", session_ids)
+    for tbl in _SESSION_DEPENDENT_TABLES:
+        if tbl in tables:
+            conn.execute(
+                f"DELETE FROM {tbl} WHERE session_id IN ({placeholders})",
+                session_ids,
+            )
     cursor = conn.execute(f"DELETE FROM session WHERE id IN ({placeholders})", session_ids)
     return cursor.rowcount
 

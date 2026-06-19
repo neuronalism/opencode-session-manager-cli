@@ -29,6 +29,7 @@ from ocsm.queries import (
     list_sessions,
     load_messages,
     load_raw_messages,
+    opencode_paths,
     replace_session,
     reset_project_id_to_global,
     session_exists,
@@ -312,7 +313,7 @@ def _import_session_tree(
         return {"imported": 0, "skipped": 0, "session_ids": [], "backup_path": None, "old_directory": None}
 
     backup_path = _checkpoint_and_backup(db_path)
-    new_directory = str(to_project.expanduser().resolve())
+    new_directory, new_path = opencode_paths(to_project)
 
     conn = get_connection(db_path)
     try:
@@ -338,6 +339,7 @@ def _import_session_tree(
                 old_directory = session.get("directory")
 
             session["directory"] = new_directory
+            session["path"] = new_path
             session["project_id"] = "global"
 
             insert_session(conn, session)
@@ -809,7 +811,7 @@ def _apply_sync(
     - Returns a summary dict for reporting.
     """
     raw_dir = _raw_dir(project_dir)
-    new_directory = str(project_dir.expanduser().resolve())
+    new_directory, new_path = opencode_paths(project_dir)
 
     to_folder_ids = set(diff["to_folder"])
     to_db_ids = set(diff["to_db"])
@@ -904,6 +906,7 @@ def _apply_sync(
                 if old_directory is None and pid is None:
                     old_directory = session.get("directory")
                 session["directory"] = new_directory
+                session["path"] = new_path
                 session["project_id"] = "global"
                 replace_session(conn, session, messages, parts)
                 imported_ids.append(sid)
@@ -928,7 +931,7 @@ def _apply_sync(
                     for c in children:
                         queue.append(c["id"])
                 if to_remove:
-                    delete_session_tree(conn, sorted(to_remove))
+                    delete_session_tree_full(conn, sorted(to_remove))
                     db_deleted = sorted(to_remove)
 
             conn.commit()
