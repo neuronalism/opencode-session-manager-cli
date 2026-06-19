@@ -13,8 +13,10 @@ CLI tool for managing OpenCode sessions stored in SQLite.
 - `uv run ocsm export session --from <id> --format raw` — export as raw JSON (import-safe)
 - `uv run ocsm export session --from <id> --tree` / `--flat` — export with subagents
 - `uv run ocsm export project --from <path>` — export all sessions of a project
+- `uv run ocsm export session --from <id> --dry-run` / `export project --from <path> --dry-run` — preview target paths, write nothing
 - `uv run ocsm import session --from <json> --to-project <path>` — import a session tree from raw JSON (path substitution on by default)
 - `uv run ocsm import project --from <dir> --to-project <path>` — import all sessions from a project's raw export
+- `uv run ocsm import session --from <json> --to-project <path> --dry-run` / `import project ... --dry-run` — preview what would be imported (no DB writes, no backup)
 - `uv run ocsm move project --from <old> --to-project <new>` — move sessions
 - `uv run ocsm sync project --from <path>` — two-way sync (DB ↔ `<project>/.opencode/raw_conversations/`), incl. deletions
 - `uv run ocsm --db <path>` / `OCSM_DB_PATH` — custom database path

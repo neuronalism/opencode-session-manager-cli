@@ -92,6 +92,13 @@ ocsm export project --from /path/to/proj --tree                     # with subag
 ocsm export project --from /path/to/proj --flat                     # with subagents (flat)
 ```
 
+Preview what would be exported without writing anything:
+
+```bash
+ocsm export session --from <ses_id> --dry-run                       # show target paths, write nothing
+ocsm export project --from /path/to/proj --dry-run                  # same, for every session of the project
+```
+
 Options for exporting:
 
 ```bash
@@ -121,6 +128,13 @@ ocsm import session --from /path/to/session.json --to-project /path/to/proj     
 ocsm import session --from /path/to/session.json --to-project /path/to/proj --no-substitute-paths  # import without replacing paths in the conversations
 ocsm import project --from /path/to/proj --to-project /path/to/proj                # import all sessions from a project's raw export
 ocsm import project --from /path/to/proj --to-project /path/to/proj --no-substitute-paths
+```
+
+Preview what would be imported without writing anything (no DB writes, no backup):
+
+```bash
+ocsm import session --from /path/to/session.json --to-project /path/to/proj --dry-run
+ocsm import project --from /path/to/proj --to-project /path/to/proj --dry-run
 ```
 
 Import only accepts raw JSON files (exported with `--format raw`). If the target directory already has sessions, conflicting session IDs are skipped.

@@ -150,6 +150,7 @@ def _export_sessions(
     tree: bool,
     thinking: bool,
     tool_calls: str,
+    dry_run: bool = False,
 ) -> list[Path]:
     is_raw = fmt == "raw"
     ext = "json" if is_raw else "md"
@@ -181,9 +182,10 @@ def _export_sessions(
         if tree and root_id and sid != root_id:
             out_dir = out_dir / root_id
 
-        out_dir.mkdir(parents=True, exist_ok=True)
         output = out_dir / f"{sid}.{ext}"
-        output.write_text(content, encoding="utf-8")
+        if not dry_run:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output.write_text(content, encoding="utf-8")
         exported.append(output)
     return exported
 
@@ -199,6 +201,7 @@ def export_session_cmd(
     flat: bool = typer.Option(False, "--flat", help="Export session and all subagent sessions (flat layout)"),
     thinking: bool = typer.Option(True, "--thinking", help="Include reasoning parts"),
     tool_calls: str = typer.Option("info", "--tool-call", help="Tool call detail level: none, info, details"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be exported and exit without writing"),
 ):
     """Export a session as markdown or raw JSON."""
     db_path = ctx.obj["db_path"]
@@ -212,11 +215,14 @@ def export_session_cmd(
                 console.print(f"[red]Error:[/red] Session '{session_id}' not found.")
                 raise typer.Exit(1)
             rows = [row]
-        exported = _export_sessions(conn, rows, to=to, to_project=to_project, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls)
+        exported = _export_sessions(conn, rows, to=to, to_project=to_project, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls, dry_run=dry_run)
     finally:
         conn.close()
+    verb = "Would export to" if dry_run else "Exported to"
     for p in exported:
-        console.print(f"Exported to {p}")
+        console.print(f"{verb} {p}")
+    if dry_run:
+        console.print("\n[dim]--dry-run: no files written.[/dim]")
 
 
 # --- Import helpers ---
@@ -356,6 +362,76 @@ def _import_session_tree(
         "old_directory": old_directory,
         "path_sub_counts": path_sub_counts,
     }
+
+
+def _plan_import(db_path: Path, tree_data: list[dict], to_project: Path) -> dict:
+    """Read-only preview of what _import_session_tree would do.
+
+    Mirrors the per-session classification in _import_session_tree (skip
+    subagents whose parent isn't in this batch, skip ids already in the DB)
+    but performs only SELECTs — no transaction, no checkpoint, no backup.
+
+    Returns {"imported": [...], "skipped": [...], "old_directory": str|None}.
+    """
+    imported: list[str] = []
+    skipped: list[str] = []
+    planned_ids: list[str] = []  # ids counted as 'present' (newly imported or pre-existing)
+    old_directory = None
+
+    conn = get_connection(db_path)
+    try:
+        for data in tree_data:
+            session, _messages, _parts = _validate_raw_json(data)
+
+            if session.get("parent_id") is not None and session["parent_id"] not in planned_ids:
+                skipped.append(session["id"])
+                continue
+
+            if session_exists(conn, session["id"]):
+                skipped.append(session["id"])
+                planned_ids.append(session["id"])
+                continue
+
+            if old_directory is None and session.get("parent_id") is None:
+                old_directory = session.get("directory")
+
+            imported.append(session["id"])
+            planned_ids.append(session["id"])
+    finally:
+        conn.close()
+
+    return {
+        "imported": imported,
+        "skipped": skipped,
+        "old_directory": old_directory,
+    }
+
+
+def _print_import_plan(plan: dict, substitute: bool, to_project: Path) -> None:
+    """Pretty-print the import preview (used by --dry-run)."""
+    new_directory = str(to_project.expanduser().resolve())
+    imported = plan["imported"]
+    skipped = plan["skipped"]
+
+    if imported:
+        console.print(f"[green]Would import {len(imported)} session(s):[/green]")
+        console.print("[dim]  project_id would be reset to 'global' — OpenCode assigns the correct ID on next startup[/dim]")
+        for sid in imported:
+            console.print(f"  {sid}")
+    if skipped:
+        console.print(f"[yellow]Would skip {len(skipped)} session(s) (already exist or parent missing):[/yellow]")
+        for sid in skipped:
+            console.print(f"  {sid}")
+    if not imported and not skipped:
+        console.print("[yellow]Nothing to import.[/yellow]")
+        return
+
+    old_directory = plan.get("old_directory")
+    if substitute and old_directory and old_directory != new_directory and imported:
+        console.print(f"\n[cyan]Would substitute paths: '{old_directory}' -> '{new_directory}'[/cyan]")
+    elif substitute:
+        console.print("\n[dim]Path substitution: no source directory to substitute.[/dim]")
+    console.print(f"[dim]Target directory: {new_directory}[/dim]")
 
 
 def _verify_with_opencode(project_dir: Path) -> bool:
@@ -1104,6 +1180,7 @@ def export_project_cmd(
     flat: bool = typer.Option(False, "--flat", help="Export with subagent sessions (flat layout)"),
     thinking: bool = typer.Option(True, "--thinking", help="Include reasoning parts"),
     tool_calls: str = typer.Option("info", "--tool-call", help="Tool call detail level: none, info, details"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be exported and exit without writing"),
 ):
     """Export all sessions of a project."""
     if flat and tree:
@@ -1117,11 +1194,14 @@ def export_project_cmd(
         if not rows:
             console.print(f"[red]Error:[/red] No sessions found for project '{project}'.")
             raise typer.Exit(1)
-        exported = _export_sessions(conn, rows, to=to, to_project=to_project, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls)
+        exported = _export_sessions(conn, rows, to=to, to_project=to_project, fmt=fmt, tree=tree, thinking=thinking, tool_calls=tool_calls, dry_run=dry_run)
     finally:
         conn.close()
+    verb = "Would export to" if dry_run else "Exported to"
     for p in exported:
-        console.print(f"Exported to {p}")
+        console.print(f"{verb} {p}")
+    if dry_run:
+        console.print("\n[dim]--dry-run: no files written.[/dim]")
 
 
 @import_app.command("session")
@@ -1130,6 +1210,7 @@ def import_session_cmd(
     json_file: Path = typer.Option(..., "--from", help="Path to raw JSON file"),
     to_project: Path = typer.Option(..., "--to-project", help="Local project directory to map to"),
     substitute_paths_flag: bool = typer.Option(True, "--substitute-paths/--no-substitute-paths", help="Replace old paths in data fields"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be imported and exit without writing"),
 ):
     """Import a session (and its subagent tree) from a raw JSON file."""
     db_path = ctx.obj["db_path"]
@@ -1151,6 +1232,12 @@ def import_session_cmd(
 
     console.print(f"Found {len(tree_data)} session(s) to import (1 root + {len(children)} subagents)")
 
+    if dry_run:
+        plan = _plan_import(db_path, tree_data, to_project)
+        _print_import_plan(plan, substitute_paths_flag, to_project)
+        console.print("\n[dim]--dry-run: no changes made, no backup created.[/dim]")
+        return
+
     try:
         result = _import_session_tree(db_path, tree_data, to_project, substitute=substitute_paths_flag)
     except Exception as e:
@@ -1169,6 +1256,7 @@ def import_project_cmd(
     from_dir: Path = typer.Option(..., "--from", help="Source project directory"),
     to_project: Path = typer.Option(..., "--to-project", help="Local project directory to map to"),
     substitute_paths_flag: bool = typer.Option(True, "--substitute-paths/--no-substitute-paths", help="Replace old paths in data fields"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be imported and exit without writing"),
 ):
     """Import all sessions from a project's raw export directory."""
     db_path = ctx.obj["db_path"]
@@ -1219,6 +1307,12 @@ def import_project_cmd(
         all_tree_data.extend(tree)
 
     console.print(f"Total {len(all_tree_data)} session(s) to import")
+
+    if dry_run:
+        plan = _plan_import(db_path, all_tree_data, to_project)
+        _print_import_plan(plan, substitute_paths_flag, to_project)
+        console.print("\n[dim]--dry-run: no changes made, no backup created.[/dim]")
+        return
 
     try:
         result = _import_session_tree(db_path, all_tree_data, to_project, substitute=substitute_paths_flag)
