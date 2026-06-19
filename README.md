@@ -1,6 +1,7 @@
 # OpenCode Session Manager CLI
 
 **tl;dr:** 
+
 A simple CLI tool for managing [OpenCode](https://github.com/opencode-ai/opencode) projects and sessions stored in SQLite. It can:
 - handle renamed/removed project folders,
 - batch export all sessions (with sub-sessions) of a project as markdown or raw JSON,
@@ -28,12 +29,12 @@ Tested on OpenCode v1.17.8 on Windows and Mac.
 OpenCode now ships its own `opencode export [sessionID]` and `opencode import <file>` commands. This tool exists to fill the gaps they leave.
 
 **What OpenCode's built-in commands do:**
-- `opencode export <sessionID>` exports a **single session** as JSON to stdout (its `info` + `messages`).
+- `opencode export <sessionID>` exports a **single session** as JSON (its `info` + `messages`).
 - `opencode import <file>` imports that single session back into the database.
 
 **What this tool adds on top:**
 
-- **Full conversation trees.** OpenCode's `export` only emits the one session you name (as of version 1.17.7). Its subagent sessions are **not** exported — their IDs only appear as strings inside a parent's tool-call metadata. Re-importing such an export therefore **loses every subagent session permanently**. This tool exports and imports the **entire tree** (root + all descendants), so a multi-agent conversation round-trips intact.
+- **Full conversation trees.** OpenCode's `export` only emits the one session you name (as of version 1.17.8). Its subagent sessions are **not** exported — their IDs only appear as strings inside a parent's tool-call metadata. Re-importing such an export therefore **loses every subagent session permanently**. This tool exports and imports the **entire tree** (root + all descendants), so a multi-agent conversation round-trips intact.
 - **Batch operations.** `export project` / `import project` work on every session of a project at once, instead of one session at a time.
 - **Two-way sync.** `sync project` reconciles the database and the project folder in both directions (new / updated / deleted), with conflict resolution and deletion propagation — none of which the built-in commands offer.
 - **Cross-machine path handling.** Imported sessions get their absolute paths rewritten to the local project directory (handling Windows ↔ Mac differences automatically); the built-in import keeps the exporting machine's paths.
@@ -111,6 +112,7 @@ Options for exporting:
 --tool-call details                  # show tool name, title, session, input, output, error
 --tree                               # subagent sessions in nested subdirectories
 --flat                               # subagent sessions in same directory
+--dry-run                            # show target paths, write nothing
 ```
 
 Default export path:
@@ -121,7 +123,7 @@ Default export path:
 
 #### Importing
 
-**Import** a session:
+**Import** a raw JSON session:
 
 ```bash
 ocsm import session --from /path/to/session.json --to-project /path/to/proj        # import one session tree
@@ -177,7 +179,20 @@ ocsm sync project --from /path/to/proj --no-delete      # turn off deletion prop
 ocsm sync project --from /path/to/proj -y               # non-interactive: skip confirmations
 ```
 
-Full option list: `--on-conflict {ask,newer,skip}`, `--delete/--no-delete`, `--yes/-y`, `--dry-run`, `--substitute-paths/--no-substitute-paths`.
+Options for syncing:
+
+```bash
+--from <path>                         # required, the project directory to sync
+--on-conflict ask                     # default, prompt per session: keep DB / keep folder / skip
+--on-conflict newer                   # auto-resolve: the side with the newer time_updated wins
+--on-conflict skip                    # leave conflicting sessions untouched on both sides
+--delete                              # default, propagate deletions via the sync manifest
+--no-delete                           # turn off deletion propagation
+--yes / -y                            # non-interactive: skip all confirmation prompts
+--dry-run                             # show the plan and exit without writing anything
+--substitute-paths                    # default, rewrite old paths to the local project dir on import
+--no-substitute-paths                 # keep the exporting machine's paths as-is
+```
 
 **How it works**
 
