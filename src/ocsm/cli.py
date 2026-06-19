@@ -18,6 +18,7 @@ from ocsm.db import get_connection, resolve_db_path
 from ocsm.format import format_projects_list, format_sessions_list, format_sessions_tree, format_timestamp, session_to_markdown, session_to_raw_json
 from ocsm.queries import (
     delete_session_tree,
+    delete_session_tree_full,
     get_session,
     get_session_timestamps,
     get_session_tree,
@@ -53,6 +54,13 @@ app.add_typer(move_app)
 
 sync_app = typer.Typer(name="sync", help="Two-way sync (incl. deletions) between DB and a project folder", no_args_is_help=True)
 app.add_typer(sync_app)
+
+export_then_delete_app = typer.Typer(
+    name="export-then-delete",
+    help="Export sessions (raw JSON, import-safe) and then permanently delete them from the DB",
+    no_args_is_help=True,
+)
+app.add_typer(export_then_delete_app)
 
 # Manifest constants for deletion propagation
 MANIFEST_VERSION = 1
@@ -767,6 +775,23 @@ def _ask_delete_confirmation(label: str, items: list[tuple[str, str | None]]) ->
     return ans in ("y", "yes")
 
 
+def _confirm_delete_by_retype(label: str, expected: str) -> bool:
+    """Require the user to re-type the exact target value to confirm a hard delete.
+
+    Used by ``export-then-delete`` as a stronger intent gate than a y/N prompt.
+    Returns True only on an exact, case-sensitive match of ``expected`` (after
+    ``.strip()``).  EOF / Ctrl-C and any mismatch return False.
+    """
+    console.print(f"\n[bold red]About to delete ({label}).[/bold red]")
+    console.print(f"  [red]target:[/red] [bold]{expected}[/bold]")
+    console.print("[dim]A raw-JSON export was just written and is restorable via `ocsm import`.[/dim]")
+    try:
+        ans = input(f"To confirm, re-type the {label} exactly: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return ans == expected
+
+
 def _apply_sync(
     db_path: Path,
     project_dir: Path,
@@ -1202,6 +1227,283 @@ def export_project_cmd(
         console.print(f"{verb} {p}")
     if dry_run:
         console.print("\n[dim]--dry-run: no files written.[/dim]")
+
+
+# --- export-then-delete ---
+
+def _etd_export(
+    conn,
+    rows: list,
+    *,
+    to: Path | None,
+    to_project: Path | None,
+    fmt_markdown: bool,
+    tree: bool,
+    thinking: bool,
+    tool_calls: str,
+    dry_run: bool,
+) -> tuple[list[Path], list[Path]]:
+    """Export phase shared by `export-then-delete session|project`.
+
+    Always writes raw JSON (import-safe); additionally writes markdown when
+    ``fmt_markdown`` is True. Returns (raw_paths, markdown_paths). On a write
+    error the exception propagates so the caller aborts before any DB mutation.
+    """
+    raw_paths = _export_sessions(
+        conn, rows, to=to, to_project=to_project, fmt="raw", tree=tree,
+        thinking=thinking, tool_calls=tool_calls, dry_run=dry_run,
+    )
+    md_paths: list[Path] = []
+    if fmt_markdown:
+        md_paths = _export_sessions(
+            conn, rows, to=to, to_project=to_project, fmt="markdown", tree=tree,
+            thinking=thinking, tool_calls=tool_calls, dry_run=dry_run,
+        )
+    return raw_paths, md_paths
+
+
+def _etd_report(
+    *, raw_paths: list[Path], md_paths: list[Path], deleted_ids: list[str],
+    backup_path: Path, project_deleted: int, raw_hint: Path, to_project: Path | None,
+) -> None:
+    """Print the export-then-delete result block."""
+    verb = "Would export to"
+    for p in raw_paths:
+        console.print(f"{verb} {p}")
+    if md_paths:
+        for p in md_paths:
+            console.print(f"{verb} {p}")
+    console.print(f"\n[red]Deleted {len(deleted_ids)} session(s) from DB[/red]")
+    for sid in deleted_ids:
+        console.print(f"  [red]x[/red] {sid}")
+    if project_deleted:
+        console.print(f"[red]Deleted {project_deleted} project row(s) from project table[/red] [dim](metadata only; OpenCode recreates it)[/dim]")
+    console.print(f"\n[dim]Backup: {backup_path}[/dim]")
+    console.print("[dim]Delete the backup manually once you confirm everything works.[/dim]")
+    target = to_project if to_project else raw_paths[0].parent
+    console.print(f"[dim]Restore with: ocsm import session --from {raw_hint} --to-project {target}[/dim]")
+
+
+@export_then_delete_app.command("session")
+def export_then_delete_session_cmd(
+    ctx: typer.Context,
+    session_id: str = typer.Option(..., "--from", help="Session ID to export, then delete"),
+    to: Path | None = typer.Option(None, "--to", help="Output directory (mutually exclusive with --to-project)"),
+    to_project: Path | None = typer.Option(None, "--to-project", help="Output to this project's .opencode dir (mutually exclusive with --to)"),
+    fmt: str = typer.Option("raw", "--format", "-f", help="Export format: raw (default, raw JSON only) or markdown (raw JSON + markdown)"),
+    tree: bool = typer.Option(False, "--tree", help="Include subagent sessions (tree layout)"),
+    flat: bool = typer.Option(False, "--flat", help="Include subagent sessions (flat layout)"),
+    thinking: bool = typer.Option(True, "--thinking/--no-thinking", help="Markdown only: include reasoning parts"),
+    tool_calls: str = typer.Option("info", "--tool-call", help="Markdown only: tool call detail level: none, info, details"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be exported/deleted and exit without writing or deleting"),
+):
+    """Export a session (always raw JSON) and then permanently delete it from the DB.
+
+    Export runs first and is mandatory; deletion only proceeds after you re-type
+    the exact session ID at the prompt. Subagent sessions in the same tree are
+    exported and deleted together. Requires a TTY for the confirmation prompt.
+    """
+    db_path = ctx.obj["db_path"]
+    _etd_validate_options(to, to_project, fmt, flat, tree)
+    fmt_markdown = fmt == "markdown"
+
+    conn = get_connection(db_path)
+    try:
+        rows = get_session_tree(conn, session_id)
+        if not rows or rows[0] is None:
+            console.print(f"[red]Error:[/red] Session '{session_id}' not found.")
+            raise typer.Exit(1)
+    finally:
+        conn.close()
+
+    # Export phase (raw JSON, plus markdown if requested). DB is untouched here.
+    conn = get_connection(db_path)
+    try:
+        try:
+            raw_paths, md_paths = _etd_export(
+                conn, rows, to=to, to_project=to_project, fmt_markdown=fmt_markdown,
+                tree=tree, thinking=thinking, tool_calls=tool_calls, dry_run=dry_run,
+            )
+        except Exception as e:
+            console.print(f"[red]Error during export: {e}[/red]")
+            console.print("[dim]DB is unchanged; nothing was deleted.[/dim]")
+            raise typer.Exit(1)
+    finally:
+        conn.close()
+
+    full_id_set = [r["id"] for r in rows]
+    console.print(f"\n[dim]Target: {len(full_id_set)} session(s) (1 root + {len(full_id_set) - 1} subagents).[/dim]")
+
+    if dry_run:
+        _etd_dry_run_report(raw_paths, md_paths, full_id_set)
+        return
+
+    # Re-type confirmation gate (always interactive; no -y bypass).
+    if not _is_interactive():
+        console.print("[red]Error:[/red] this command requires an interactive TTY to confirm deletion.")
+        raise typer.Exit(1)
+    if not _confirm_delete_by_retype("session ID", session_id):
+        console.print("[yellow]Delete aborted (re-type did not match). Exported files remain on disk so you can retry.[/yellow]")
+        raise typer.Exit(1)
+
+    deleted_ids, backup_path, project_deleted = _etd_delete(db_path, full_id_set, project_path=None)
+    _etd_report(
+        raw_paths=raw_paths, md_paths=md_paths, deleted_ids=deleted_ids,
+        backup_path=backup_path, project_deleted=project_deleted,
+        raw_hint=raw_paths[0], to_project=to_project,
+    )
+
+
+@export_then_delete_app.command("project")
+def export_then_delete_project_cmd(
+    ctx: typer.Context,
+    project: str = typer.Option(..., "--from", help="Project directory path to export, then delete"),
+    to: Path | None = typer.Option(None, "--to", help="Output directory (mutually exclusive with --to-project)"),
+    to_project: Path | None = typer.Option(None, "--to-project", help="Output to this project's .opencode dir (mutually exclusive with --to)"),
+    fmt: str = typer.Option("raw", "--format", "-f", help="Export format: raw (default, raw JSON only) or markdown (raw JSON + markdown)"),
+    tree: bool = typer.Option(False, "--tree", help="Include subagent sessions (tree layout)"),
+    flat: bool = typer.Option(False, "--flat", help="Include subagent sessions (flat layout)"),
+    thinking: bool = typer.Option(True, "--thinking/--no-thinking", help="Markdown only: include reasoning parts"),
+    tool_calls: str = typer.Option("info", "--tool-call", help="Markdown only: tool call detail level: none, info, details"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be exported/deleted and exit without writing or deleting"),
+):
+    """Export all sessions of a project (always raw JSON) and then permanently delete them from the DB.
+
+    Export runs first and is mandatory; deletion only proceeds after you re-type
+    the exact project path at the prompt. Requires a TTY for the confirmation
+    prompt.
+    """
+    db_path = ctx.obj["db_path"]
+    _etd_validate_options(to, to_project, fmt, flat, tree)
+    fmt_markdown = fmt == "markdown"
+
+    resolved = str(Path(project).expanduser().resolve())
+    conn = get_connection(db_path)
+    try:
+        rows = list_sessions(conn, resolved, include_children=True)
+        if not rows:
+            console.print(f"[red]Error:[/red] No sessions found for project '{project}'.")
+            raise typer.Exit(1)
+    finally:
+        conn.close()
+
+    # Expand to whole trees so every subagent is exported AND deleted (no orphans).
+    full_id_set = _etd_expand_trees(db_path, [r["id"] for r in rows])
+
+    # Export phase (raw JSON, plus markdown if requested). DB is untouched here.
+    conn = get_connection(db_path)
+    try:
+        try:
+            raw_paths, md_paths = _etd_export(
+                conn, rows, to=to, to_project=to_project, fmt_markdown=fmt_markdown,
+                tree=tree, thinking=thinking, tool_calls=tool_calls, dry_run=dry_run,
+            )
+        except Exception as e:
+            console.print(f"[red]Error during export: {e}[/red]")
+            console.print("[dim]DB is unchanged; nothing was deleted.[/dim]")
+            raise typer.Exit(1)
+    finally:
+        conn.close()
+
+    console.print(f"\n[dim]Target: {len(full_id_set)} session(s) across {len(rows)} root(s).[/dim]")
+
+    if dry_run:
+        _etd_dry_run_report(raw_paths, md_paths, full_id_set)
+        return
+
+    # Re-type confirmation gate (always interactive; no -y bypass).
+    if not _is_interactive():
+        console.print("[red]Error:[/red] this command requires an interactive TTY to confirm deletion.")
+        raise typer.Exit(1)
+    if not _confirm_delete_by_retype("project path", project):
+        console.print("[yellow]Delete aborted (re-type did not match). Exported files remain on disk so you can retry.[/yellow]")
+        raise typer.Exit(1)
+
+    deleted_ids, backup_path, project_deleted = _etd_delete(db_path, full_id_set, project_path=resolved)
+    _etd_report(
+        raw_paths=raw_paths, md_paths=md_paths, deleted_ids=deleted_ids,
+        backup_path=backup_path, project_deleted=project_deleted,
+        raw_hint=raw_paths[0], to_project=to_project,
+    )
+
+
+def _etd_validate_options(to: Path | None, to_project: Path | None, fmt: str, flat: bool, tree: bool) -> None:
+    """Shared validation for the two export-then-delete commands."""
+    if (to is None) == (to_project is None):
+        console.print("[red]Error:[/red] exactly one of --to / --to-project is required.")
+        raise typer.Exit(1)
+    if to is not None and to_project is not None:
+        console.print("[red]Error:[/red] --to and --to-project are mutually exclusive.")
+        raise typer.Exit(1)
+    if fmt not in ("raw", "markdown"):
+        console.print(f"[red]Error:[/red] --format must be one of: raw, markdown")
+        raise typer.Exit(2)
+    if flat and tree:
+        console.print("[red]Error:[/red] --flat and --tree are mutually exclusive.")
+        raise typer.Exit(1)
+
+
+def _etd_expand_trees(db_path: Path, root_ids: list[str]) -> list[str]:
+    """BFS-expand root session ids to include all descendants (mirrors _apply_sync)."""
+    conn = get_connection(db_path)
+    try:
+        to_remove: set[str] = set()
+        queue = list(root_ids)
+        while queue:
+            cur = queue.pop(0)
+            if cur in to_remove:
+                continue
+            to_remove.add(cur)
+            children = conn.execute(
+                "SELECT id FROM session WHERE parent_id = ?", (cur,)
+            ).fetchall()
+            for c in children:
+                queue.append(c["id"])
+        return sorted(to_remove)
+    finally:
+        conn.close()
+
+
+def _etd_dry_run_report(raw_paths: list[Path], md_paths: list[Path], full_id_set: list[str]) -> None:
+    """Print paths + the deletion plan, then exit without touching DB."""
+    for p in raw_paths:
+        console.print(f"Would export to {p}")
+    for p in md_paths:
+        console.print(f"Would export to {p}")
+    console.print(f"\n[red]Would delete {len(full_id_set)} session(s) from DB:[/red]")
+    for sid in full_id_set:
+        console.print(f"  [red]x[/red] {sid}")
+    console.print("\n[dim]--dry-run: no files written, nothing deleted.[/dim]")
+
+
+def _etd_delete(db_path: Path, session_ids: list[str], *, project_path: str | None) -> tuple[list[str], Path, int]:
+    """Run the DB deletion: backup, BEGIN, delete_session_tree_full, optional project row, commit.
+
+    Returns (deleted_session_ids, backup_path, project_rows_deleted). On any error
+    rolls back and re-raises.
+    """
+    backup_path = _checkpoint_and_backup(db_path)
+    conn = get_connection(db_path)
+    project_deleted = 0
+    try:
+        conn.execute("BEGIN")
+        delete_session_tree_full(conn, session_ids)
+        if project_path is not None:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            if "project" in tables:
+                cursor = conn.execute(
+                    "DELETE FROM project WHERE worktree = ?", (project_path,)
+                )
+                project_deleted = cursor.rowcount
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return session_ids, backup_path, project_deleted
 
 
 @import_app.command("session")

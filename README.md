@@ -125,7 +125,7 @@ Default export path:
 
 **Import** a raw JSON session:
 
-```bash
+```
 ocsm import session --from /path/to/session.json --to-project /path/to/proj        # import one session tree
 ocsm import session --from /path/to/session.json --to-project /path/to/proj --no-substitute-paths  # import without replacing paths in the conversations
 ocsm import project --from /path/to/proj --to-project /path/to/proj                # import all sessions from a project's raw export
@@ -160,7 +160,7 @@ Import only accepts raw JSON files (exported with `--format raw`). If the target
 
 The simplest way to keep a project portable:
 
-```bash
+```
 # on machine A
 ocsm sync project --from /path/to/proj      # writes DB sessions into the folder
 # git push / cloud-sync the project folder
@@ -170,7 +170,7 @@ ocsm sync project --from /path/to/proj      # pulls new folder sessions into the
 
 **Common usage:**
 
-```bash
+```
 ocsm sync project --from /path/to/proj                  # default: prompt on conflicts, deletions on
 ocsm sync project --from /path/to/proj --dry-run        # preview the plan, write nothing
 ocsm sync project --from /path/to/proj --on-conflict newer   # auto-resolve: newer time_updated wins
@@ -181,7 +181,7 @@ ocsm sync project --from /path/to/proj -y               # non-interactive: skip 
 
 Options for syncing:
 
-```bash
+```
 --from <path>                         # required, the project directory to sync
 --on-conflict ask                     # default, prompt per session: keep DB / keep folder / skip
 --on-conflict newer                   # auto-resolve: the side with the newer time_updated wins
@@ -228,6 +228,40 @@ ocsm move project --from-id <id> --to-id <id>                 # move by project 
 > - The new path can either be a project existing or not in the database. The "move" command only manipulates the paths in the database, and does not move the project folder and the files.
 > - The safe pipeline is also used for this command.
 
+#### Deleting sessions/projects from the database
+
+**export-then-delete** permanently removes sessions (or a whole project) from the database — but only after writing an import-safe raw-JSON export first. There is no standalone delete command: export and delete are deliberately coupled for safety considerations.
+
+```bash
+ocsm export-then-delete session --from <ses_id> --to /backup/dir           # export raw JSON, then delete the session
+ocsm export-then-delete session --from <ses_id> --to-project /other/proj   # export into another project's .opencode dir
+ocsm export-then-delete project --from /path/to/proj --to /backup/dir      # export all sessions, then delete them + the project row
+
+ocsm export-then-delete session --from <ses_id> --to /backup --format markdown  # raw JSON *and* markdown
+ocsm export-then-delete project --from /path/to/proj --to /backup --dry-run      # preview, write/delete nothing
+```
+
+Because deletion is irreversible, the command asks you to **re-type the exact `--from` value** (session id or project path) at an interactive prompt before touching the database. There is no `-y` bypass.
+
+```bash
+--from <id>|<path>                     # required, the session id or project directory to export-then-delete
+--to <dir>                             # output directory (required, mutually exclusive with --to-project)
+--to-project <path>                    # write to <path>/.opencode/raw_conversations (mutually exclusive with --to)
+--format raw                           # default: raw JSON only
+--format markdown                      # raw JSON + markdown (both)
+--tree / --flat                        # include subagent sessions
+--thinking / --no-thinking             # markdown only: include reasoning parts
+--tool-call none|info|details          # markdown only: tool-call detail level
+--dry-run                              # show the export targets and the deletion list, do nothing
+```
+
+> [!IMPORTANT]
+>
+> - **Export is mandatory and always raw JSON.** Raw JSON is the only format `import` can fully restore, so it is written on every invocation (additionally markdown when `--format markdown`). The deletion phase is skipped entirely if the export fails.
+> - **An explicit destination is required.** Exactly one of `--to` / `--to-project` must be given — the default `.opencode/raw_conversations/` location may disappear when a project is deleted, so the export has to land somewhere predictable.
+> - **Trees are atomic.** `session` exports and deletes the whole tree (root + subagents); `project` deletes every matching root plus all its subagents, so no orphaned rows are left behind.
+> - **Same safe pipeline as import/sync**: WAL checkpoint + timestamped `.bak` backup + single transaction with rollback. The report prints a concrete `ocsm import session --from <file> --to-project <path>` line so you can restore immediately if needed.
+
 ### Use custom database path
 
 - `ocsm --db <path> list session`
@@ -241,6 +275,7 @@ ocsm move project --from-id <id> --to-id <id>                 # move by project 
 - [x] import raw jsons into database
 - [x] move project paths (after rename/relocate)
 - [x] sync conversations in two ways with local project folder
+- [x] export-then-delete (export raw JSON then permanently remove sessions/projects)
 
 ## License
 

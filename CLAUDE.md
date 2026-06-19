@@ -19,6 +19,8 @@ CLI tool for managing OpenCode sessions stored in SQLite.
 - `uv run ocsm import session --from <json> --to-project <path> --dry-run` / `import project ... --dry-run` — preview what would be imported (no DB writes, no backup)
 - `uv run ocsm move project --from <old> --to-project <new>` — move sessions
 - `uv run ocsm sync project --from <path>` — two-way sync (DB ↔ `<project>/.opencode/raw_conversations/`), incl. deletions
+- `uv run ocsm export-then-delete session --from <id> --to <dir> | --to-project <path>` — export a session (raw JSON, import-safe) then permanently delete it from the DB
+- `uv run ocsm export-then-delete project --from <path> --to <dir> | --to-project <path>` — export all sessions of a project then permanently delete them (and the project row) from the DB
 - `uv run ocsm --db <path>` / `OCSM_DB_PATH` — custom database path
 
 ## Project Structure
@@ -77,3 +79,15 @@ Key relationships:
 - **Manifest**: atomic write (tempfile + `os.replace`); records ids present on BOTH sides after sync so a later one-sided removal is detectable. Deleting it resets to first-sync.
 - **Writes**: DB writes go through the same safety pipeline as import (checkpoint + backup + single transaction + rollback). "Update in place" = DELETE + INSERT via `replace_session` (message/part rows may have changed).
 - **Subagents**: a session's direction follows its root, preserving tree integrity.
+- **Deletion cleanup**: deletion propagation to the DB uses `delete_session_tree_full` (NOT `delete_session_tree`), so `part`, `message`, `todo`, `session_message`, `session_input`, `session_share`, `session_context_epoch` are all removed — no orphaned rows. `replace_session` still uses `delete_session_tree` (which preserves those rows) because the same id is re-inserted.
+
+## Export-then-delete
+
+`export-then-delete session|project` exports first (always raw JSON, import-safe) and only then permanently deletes from the DB. The two phases are coupled on purpose: there is no standalone delete command.
+
+- **Mandatory explicit destination**: exactly one of `--to <dir>` / `--to-project <path>` is required (mutually exclusive). The default per-session `.opencode/raw_conversations/` location is unavailable because it may vanish when the project is deleted.
+- **Format**: `--format raw` (default) writes raw JSON only; `--format markdown` writes **both** raw JSON and markdown. Raw JSON is always written because it is the only re-importable format.
+- **Confirmation gate**: deletion requires re-typing the exact `--from` value (session ID or project path) at an interactive prompt — there is **no `-y` bypass**. Non-TTY invocations abort with an error before any DB change. EOF / Ctrl-C / any mismatch aborts (exported files are kept so the user can retry).
+- **Tree integrity**: `session` exports+deletes the whole tree (root + subagents via `get_session_tree`); `project` BFS-expands every matching root so subagents are included on both sides.
+- **Deletion**: `delete_session_tree_full` (full cascade) +, for `project`, a table-exists-guarded `DELETE FROM project WHERE worktree = ?` (the `project` row is metadata only; OpenCode recreates it). Single transaction with rollback; backup via `_checkpoint_and_backup` first.
+- **Recovery**: the report prints a concrete `ocsm import session --from <exported.json> --to-project <path>` hint plus the backup path.
