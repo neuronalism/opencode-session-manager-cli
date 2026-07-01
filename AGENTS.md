@@ -46,8 +46,9 @@ Key relationships:
 
 - `load_messages()` — parses JSON `data` fields, injects `id`/`sessionID`/`time`. Used for markdown export.
 - `load_raw_messages()` — preserves original `data` JSON strings. Used for raw export (import-safe).
-- `session_info()` — transforms row to camelCase dict (readable). Only used for legacy raw format reference.
 - Raw export uses `dict(row)` directly — no transformation, no null dropping.
+- `SESSION_COLUMNS` — the full column set of the `session` table (29 cols as of OpenCode 1.17+). Must be kept in sync with the live schema: `insert_session` only writes keys present in the source dict, so stale columns are silently dropped on import. A previous gap (missing `path`/`agent`/`model`/`cost`/`tokens_*`/`metadata`) left imported sessions **invisible/unopenable** in the OpenCode UI because the `path` column stayed NULL. When the DB schema gains columns, extend this list (schema order, from `PRAGMA table_info(session)`).
+- `opencode_paths(to_project)` — derives the two OpenCode storage-convention columns for a target project: `directory` (absolute, forward slashes, upper-cased Windows drive letter, e.g. `D:/foo`) and `path` (drive/root stripped, e.g. `foo`). OpenCode matches sessions by these **forward-slash** forms; `Path.resolve()` yields backslashes on Windows which OpenCode will NOT match, so any code writing `directory`/`path` must go through this helper. Import and sync recompute both unconditionally (they are structural identity columns, not user data). Path text inside `message`/`part.data` is handled separately by `substitute_paths` (prefix replacement).
 - Markdown default dir: `<project>/.opencode/conversations/`
 - Raw default dir: `<project>/.opencode/raw_conversations/`
 - Project dir missing → fallback to `cwd`
@@ -59,7 +60,7 @@ Key relationships:
 
 1. SQLite WAL checkpoint (`PRAGMA wal_checkpoint(TRUNCATE)`)
 2. Full database backup (`opencode.db.bak.<timestamp>`)
-3. Import sessions (skip existing IDs, replace `session.directory`, insert session → message → part)
+3. Import sessions (skip existing IDs; recompute `session.directory` + `session.path` via `opencode_paths` to OpenCode's forward-slash convention; write all `SESSION_COLUMNS` present in the source dict; insert session → message → part)
 4. Tree integrity validation (all parent-child references verified)
 5. OpenCode runtime verification (`opencode db PRAGMA integrity_check`)
 6. Report results + backup location (user deletes backup manually)
@@ -77,7 +78,7 @@ Key relationships:
 - **Conflicts**: `--on-conflict ask` (interactive, requires TTY; else abort) | `newer` | `skip`.
 - **Deletion propagation**: only when manifest exists; **first sync never deletes**. Whole-tree (root removal cascades to subagents). Confirmed interactively (default N) unless `-y`; skipped in non-interactive mode without `-y`.
 - **Manifest**: atomic write (tempfile + `os.replace`); records ids present on BOTH sides after sync so a later one-sided removal is detectable. Deleting it resets to first-sync.
-- **Writes**: DB writes go through the same safety pipeline as import (checkpoint + backup + single transaction + rollback). "Update in place" = DELETE + INSERT via `replace_session` (message/part rows may have changed).
+- **Writes**: DB writes go through the same safety pipeline as import (checkpoint + backup + single transaction + rollback). "Update in place" = DELETE + INSERT via `replace_session` (message/part rows may have changed). The folder→DB direction rewrites `directory`/`path` via `opencode_paths` and writes all 29 `SESSION_COLUMNS` — identical handling to `import`, so the same schema/path fixes apply.
 - **Subagents**: a session's direction follows its root, preserving tree integrity.
 - **Deletion cleanup**: deletion propagation to the DB uses `delete_session_tree_full` (NOT `delete_session_tree`), so `part`, `message`, `todo`, `session_message`, `session_input`, `session_share`, `session_context_epoch` are all removed — no orphaned rows. `replace_session` still uses `delete_session_tree` (which preserves those rows) because the same id is re-inserted.
 

@@ -8,7 +8,7 @@ A simple CLI tool for managing [OpenCode](https://github.com/opencode-ai/opencod
 - import raw JSON sessions (with sub-sessions) into the database, and 
 - sync project-stored JSON sessions with the local database, allowing cross-device project synchronization.
 
-Tested on OpenCode v1.17.8 on Windows and Mac.
+Tested on OpenCode v1.17.11 on Windows and Mac.
 
 > [!CAUTION]
 > 
