@@ -17,6 +17,7 @@ from rich.console import Console
 from ocsm.db import get_connection, resolve_db_path
 from ocsm.format import format_projects_list, format_sessions_list, format_sessions_tree, format_timestamp, session_to_markdown, session_to_raw_json
 from ocsm.queries import (
+    delete_project_by_worktree,
     delete_session_tree,
     delete_session_tree_full,
     get_session,
@@ -1492,14 +1493,8 @@ def _etd_delete(db_path: Path, session_ids: list[str], *, project_path: str | No
         conn.execute("BEGIN")
         delete_session_tree_full(conn, session_ids)
         if project_path is not None:
-            tables = {row[0] for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()}
-            if "project" in tables:
-                cursor = conn.execute(
-                    "DELETE FROM project WHERE worktree = ?", (project_path,)
-                )
-                project_deleted = cursor.rowcount
+            normalized, _ = opencode_paths(Path(project_path))
+            project_deleted = delete_project_by_worktree(conn, normalized)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1639,8 +1634,10 @@ def move_project_cmd(
 ):
     """Move all sessions from one project directory to another."""
     db_path = ctx.obj["db_path"]
-    old_path = str(from_dir.expanduser().resolve())
-    new_path = str(to_project.expanduser().resolve())
+    # OpenCode matches directories by the forward-slash form (see opencode_paths);
+    # Path.resolve() yields backslashes on Windows, which no stored value matches.
+    old_path, _old_rel = opencode_paths(from_dir)
+    new_path, new_rel = opencode_paths(to_project)
 
     if old_path == new_path:
         console.print("[yellow]Source and destination paths are the same. Nothing to do.[/yellow]")
@@ -1684,7 +1681,7 @@ def move_project_cmd(
     conn = get_connection(db_path)
     try:
         conn.execute("BEGIN")
-        dir_updated = update_session_directory(conn, session_ids, old_path, new_path)
+        dir_updated = update_session_directory(conn, session_ids, old_path, new_path, new_rel)
         project_updated = update_project_worktree(conn, old_path, new_path)
         pid_reset = reset_project_id_to_global(conn, session_ids)
         path_sub_counts = substitute_paths(conn, session_ids, old_path, new_path)
@@ -1702,7 +1699,12 @@ def move_project_cmd(
         console.print(f"[yellow]Skipped {len(skipped_ids)} session(s) (already exist at target):[/yellow]")
         for sid in skipped_ids:
             console.print(f"  {sid}")
-    console.print(f"  session.directory updated: {dir_updated} row(s)")
+    console.print(f"  session.directory/path updated: {dir_updated} row(s)")
+    if dir_updated < len(session_ids):
+        console.print(
+            f"[yellow]Warning: {len(session_ids) - dir_updated} session(s) did not match the "
+            "stored directory form; their directory was left unchanged.[/yellow]"
+        )
     if pid_reset:
         console.print(f"  session.project_id reset to 'global': {pid_reset} row(s) [dim]— OpenCode will assign the correct ID on next startup[/dim]")
     if project_updated:

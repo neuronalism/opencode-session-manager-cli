@@ -366,36 +366,102 @@ def substitute_paths(conn: sqlite3.Connection, session_ids: list[str], old_path:
 
 
 def update_session_directory(
-    conn: sqlite3.Connection, session_ids: list[str], old_path: str, new_path: str
+    conn: sqlite3.Connection,
+    session_ids: list[str],
+    old_path: str,
+    new_path: str,
+    new_rel_path: str | None = None,
 ) -> int:
-    """Update session.directory from old_path to new_path for the given session IDs."""
+    """Update session.directory (and the derived ``path`` column) for the given session IDs.
+
+    ``old_path``/``new_path`` must be in OpenCode's storage convention (see
+    :func:`opencode_paths`). The WHERE matches the stored directory in either
+    slash convention — OpenCode writes forward slashes but some legacy rows
+    carry OS-native backslashes, and a raw ``directory = ?`` against the wrong
+    form silently updates nothing (which is how ``move`` used to no-op on
+    Windows). When ``new_rel_path`` is given, ``path`` is recomputed alongside
+    ``directory`` so the two structural columns stay consistent.
+    """
     if not session_ids or old_path == new_path:
         return 0
     placeholders = ", ".join(["?"] * len(session_ids))
+    set_clause = "directory = ?"
+    params: list = [new_path]
+    if new_rel_path is not None:
+        set_clause += ", path = ?"
+        params.append(new_rel_path)
     cursor = conn.execute(
-        f"UPDATE session SET directory = ? WHERE directory = ? AND id IN ({placeholders})",
-        [new_path, old_path] + session_ids,
+        f"UPDATE session SET {set_clause} "
+        f"WHERE (REPLACE(directory, '\\', '/') = ? OR directory = ?) AND id IN ({placeholders})",
+        params + [old_path, old_path] + session_ids,
     )
     return cursor.rowcount
 
 
 def update_project_worktree(conn: sqlite3.Connection, old_path: str, new_path: str) -> int:
-    """Update project.worktree from old_path to new_path.
+    """Update project.worktree from old_path to new_path (both in OpenCode's
+    forward-slash convention, see :func:`opencode_paths`).
 
     The project table stores icon_url (base64 data URL) and icon_color, keyed by
     worktree (the project directory).  Moving sessions without updating this table
     causes project icons to disappear in the OpenCode web UI.
+
+    The WHERE matches the stored worktree in either slash convention — a raw
+    ``worktree = ?`` against a backslash-resolved path matched nothing on
+    Windows, silently leaving the old project row behind. On newer schemas the
+    rename is also mirrored into ``project_directory`` (directory → project
+    mappings) so those rows don't go stale. Returns project rows updated.
     """
     if old_path == new_path:
         return 0
-    # Check if the project table exists (older DBs may not have it)
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     if "project" not in tables:
         return 0
     cursor = conn.execute(
-        "UPDATE project SET worktree = ? WHERE worktree = ?",
-        [new_path, old_path],
+        "UPDATE project SET worktree = ? WHERE (REPLACE(worktree, '\\', '/') = ? OR worktree = ?)",
+        [new_path, old_path, old_path],
     )
+    updated = cursor.rowcount
+    if "project_directory" in tables:
+        conn.execute(
+            "UPDATE project_directory SET directory = ? WHERE (REPLACE(directory, '\\', '/') = ? OR directory = ?)",
+            [new_path, old_path, old_path],
+        )
+    return updated
+
+
+# Tables that reference project.id (besides session) via declared FOREIGN KEY ...
+# ON DELETE CASCADE. The cascade never fires on ocsm connections (foreign_keys is
+# OFF), so removing a project row must clean these by hand, mirroring the schema.
+_PROJECT_DEPENDENT_TABLES = ("permission", "workspace", "project_directory")
+
+
+def delete_project_by_worktree(conn: sqlite3.Connection, project_path: str) -> int:
+    """Delete the project row(s) whose worktree matches project_path, plus rows
+    that reference them.
+
+    ``project_path`` must be in OpenCode's forward-slash convention (see
+    :func:`opencode_paths`); the match also accepts OS-native backslash rows.
+    Referencing rows in ``permission`` / ``workspace`` / ``project_directory``
+    are removed explicitly because the declared ``ON DELETE CASCADE`` does not
+    fire on ocsm connections — skipping them leaves rows that fail
+    ``PRAGMA foreign_key_check``. Returns the number of project rows deleted.
+    """
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "project" not in tables:
+        return 0
+    rows = conn.execute(
+        "SELECT id FROM project WHERE (REPLACE(worktree, '\\', '/') = ? OR worktree = ?)",
+        [project_path, project_path],
+    ).fetchall()
+    if not rows:
+        return 0
+    ids = [r[0] for r in rows]
+    placeholders = ", ".join(["?"] * len(ids))
+    for tbl in _PROJECT_DEPENDENT_TABLES:
+        if tbl in tables:
+            conn.execute(f"DELETE FROM {tbl} WHERE project_id IN ({placeholders})", ids)
+    cursor = conn.execute(f"DELETE FROM project WHERE id IN ({placeholders})", ids)
     return cursor.rowcount
 
 
