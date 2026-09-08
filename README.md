@@ -239,6 +239,7 @@ ocsm export-then-delete project --from /path/to/proj --to /backup/dir      # exp
 
 ocsm export-then-delete session --from <ses_id> --to /backup --format markdown  # raw JSON *and* markdown
 ocsm export-then-delete project --from /path/to/proj --to /backup --dry-run      # preview, write/delete nothing
+ocsm export-then-delete project --from /path/to/proj --to /backup --vacuum       # also VACUUM the DB to reclaim disk space
 ```
 
 Because deletion is irreversible, the command asks you to **re-type the exact `--from` value** (session id or project path) at an interactive prompt before touching the database. There is no `-y` bypass.
@@ -253,6 +254,7 @@ Because deletion is irreversible, the command asks you to **re-type the exact `-
 --thinking / --no-thinking             # markdown only: include reasoning parts
 --tool-call none|info|details          # markdown only: tool-call detail level
 --dry-run                              # show the export targets and the deletion list, do nothing
+--vacuum                              # project only: rebuild the DB file after deletion to reclaim disk space
 ```
 
 > [!IMPORTANT]

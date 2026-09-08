@@ -1370,12 +1370,13 @@ def export_then_delete_project_cmd(
     thinking: bool = typer.Option(True, "--thinking/--no-thinking", help="Markdown only: include reasoning parts"),
     tool_calls: str = typer.Option("info", "--tool-call", help="Markdown only: tool call detail level: none, info, details"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be exported/deleted and exit without writing or deleting"),
+    vacuum: bool = typer.Option(False, "--vacuum", help="Rebuild the DB file after deletion to reclaim disk space (SQLite otherwise keeps deleted pages on its freelist)"),
 ):
     """Export all sessions of a project (always raw JSON) and then permanently delete them from the DB.
 
     Export runs first and is mandatory; deletion only proceeds after you re-type
     the exact project path at the prompt. Requires a TTY for the confirmation
-    prompt.
+    prompt. --vacuum rebuilds the DB file afterwards to reclaim disk space.
     """
     db_path = ctx.obj["db_path"]
     _etd_validate_options(to, to_project, fmt, flat, tree)
@@ -1413,6 +1414,8 @@ def export_then_delete_project_cmd(
 
     if dry_run:
         _etd_dry_run_report(raw_paths, md_paths, full_id_set)
+        if vacuum:
+            console.print("[dim]--vacuum: would rebuild the DB file after deletion to reclaim freed pages.[/dim]")
         return
 
     # Re-type confirmation gate (always interactive; no -y bypass).
@@ -1429,6 +1432,8 @@ def export_then_delete_project_cmd(
         backup_path=backup_path, project_deleted=project_deleted,
         raw_hint=raw_paths[0], to_project=to_project,
     )
+    if vacuum:
+        _vacuum_db(db_path)
 
 
 def _etd_validate_options(to: Path | None, to_project: Path | None, fmt: str, flat: bool, tree: bool) -> None:
@@ -1502,6 +1507,47 @@ def _etd_delete(db_path: Path, session_ids: list[str], *, project_path: str | No
     finally:
         conn.close()
     return session_ids, backup_path, project_deleted
+
+
+def _format_bytes(n: int) -> str:
+    value = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.2f} {unit}"
+        value /= 1024
+
+
+def _vacuum_db(db_path: Path) -> None:
+    """VACUUM the DB file to return freed pages to the OS.
+
+    A committed DELETE only moves pages onto SQLite's freelist — the file keeps
+    its pre-delete size (and every future ocsm backup copies that bloat), so
+    mass deletions should be followed by a VACUUM rebuild. Runs strictly after
+    the deletion transaction; a failure here is non-fatal by design: the
+    deletion is already committed and the DB is consistent, only the space
+    reclamation is skipped.
+    """
+    before = db_path.stat().st_size
+    console.print("\n[cyan]Vacuuming database (may take a while)...[/cyan]")
+    try:
+        conn = get_connection(db_path)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        console.print(f"[yellow]Warning: VACUUM failed: {e}[/yellow]")
+        console.print(
+            "[dim]The deletion is already committed; only disk-space reclamation was skipped. "
+            'Common causes: OpenCode is running (locked DB) or insufficient free disk. Retry later with: sqlite3 <db> "VACUUM"[/dim]'
+        )
+        return
+    after = db_path.stat().st_size
+    console.print(
+        f"[green]Vacuumed DB:[/green] {_format_bytes(before)} -> {_format_bytes(after)} "
+        f"(reclaimed {_format_bytes(before - after)})"
+    )
 
 
 @import_app.command("session")
