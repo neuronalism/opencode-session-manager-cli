@@ -17,7 +17,6 @@ from rich.console import Console
 from ocsm.db import default_db_path, get_connection, resolve_db_path
 from ocsm.format import format_projects_list, format_sessions_list, format_sessions_tree, format_timestamp, session_to_markdown, session_to_raw_json
 from ocsm.queries import (
-    delete_project_by_worktree,
     delete_session_tree,
     delete_session_tree_full,
     get_session,
@@ -1292,7 +1291,7 @@ def _etd_export(
 
 def _etd_report(
     *, raw_paths: list[Path], md_paths: list[Path], deleted_ids: list[str],
-    backup_path: Path, project_deleted: int, raw_hint: Path, to_project: Path | None,
+    backup_path: Path, raw_hint: Path, to_project: Path | None,
 ) -> None:
     """Print the export-then-delete result block."""
     verb = "Would export to"
@@ -1304,8 +1303,6 @@ def _etd_report(
     console.print(f"\n[red]Deleted {len(deleted_ids)} session(s) from DB[/red]")
     for sid in deleted_ids:
         console.print(f"  [red]x[/red] {sid}")
-    if project_deleted:
-        console.print(f"[red]Deleted {project_deleted} project row(s) from project table[/red] [dim](metadata only; OpenCode recreates it)[/dim]")
     console.print(f"\n[dim]Backup: {backup_path}[/dim]")
     console.print("[dim]Delete the backup manually once you confirm everything works.[/dim]")
     target = to_project if to_project else raw_paths[0].parent
@@ -1374,10 +1371,10 @@ def export_then_delete_session_cmd(
         console.print("[yellow]Delete aborted (re-type did not match). Exported files remain on disk so you can retry.[/yellow]")
         raise typer.Exit(1)
 
-    deleted_ids, backup_path, project_deleted = _etd_delete(db_path, full_id_set, project_path=None)
+    deleted_ids, backup_path = _etd_delete(db_path, full_id_set)
     _etd_report(
         raw_paths=raw_paths, md_paths=md_paths, deleted_ids=deleted_ids,
-        backup_path=backup_path, project_deleted=project_deleted,
+        backup_path=backup_path,
         raw_hint=raw_paths[0], to_project=to_project,
     )
 
@@ -1450,10 +1447,10 @@ def export_then_delete_project_cmd(
         console.print("[yellow]Delete aborted (re-type did not match). Exported files remain on disk so you can retry.[/yellow]")
         raise typer.Exit(1)
 
-    deleted_ids, backup_path, project_deleted = _etd_delete(db_path, full_id_set, project_path=resolved)
+    deleted_ids, backup_path = _etd_delete(db_path, full_id_set)
     _etd_report(
         raw_paths=raw_paths, md_paths=md_paths, deleted_ids=deleted_ids,
-        backup_path=backup_path, project_deleted=project_deleted,
+        backup_path=backup_path,
         raw_hint=raw_paths[0], to_project=to_project,
     )
     if vacuum:
@@ -1509,28 +1506,30 @@ def _etd_dry_run_report(raw_paths: list[Path], md_paths: list[Path], full_id_set
     console.print("\n[dim]--dry-run: no files written, nothing deleted.[/dim]")
 
 
-def _etd_delete(db_path: Path, session_ids: list[str], *, project_path: str | None) -> tuple[list[str], Path, int]:
-    """Run the DB deletion: backup, BEGIN, delete_session_tree_full, optional project row, commit.
+def _etd_delete(db_path: Path, session_ids: list[str]) -> tuple[list[str], Path]:
+    """Run the DB deletion: backup, BEGIN, delete_session_tree_full, commit.
 
-    Returns (deleted_session_ids, backup_path, project_rows_deleted). On any error
-    rolls back and re-raises.
+    Deliberately scoped to the given conversations and their dependent rows
+    (incl. event/event_sequence): ocsm manages sessions per folder, not
+    OpenCode's cross-folder project model, so project / project_directory /
+    permission / workspace rows are never touched — other directories' sessions
+    may still depend on them.
+
+    Returns (deleted_session_ids, backup_path). On any error rolls back and
+    re-raises.
     """
     backup_path = _checkpoint_and_backup(db_path)
     conn = get_connection(db_path)
-    project_deleted = 0
     try:
         conn.execute("BEGIN")
         delete_session_tree_full(conn, session_ids)
-        if project_path is not None:
-            normalized, _ = opencode_paths(Path(project_path))
-            project_deleted = delete_project_by_worktree(conn, normalized)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    return session_ids, backup_path, project_deleted
+    return session_ids, backup_path
 
 
 def _format_bytes(n: int) -> str:

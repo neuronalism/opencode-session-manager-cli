@@ -478,36 +478,10 @@ def update_project_worktree(conn: sqlite3.Connection, old_path: str, new_path: s
 # Tables that reference project.id (besides session) via declared FOREIGN KEY ...
 # ON DELETE CASCADE. The cascade never fires on ocsm connections (foreign_keys is
 # OFF), so removing a project row must clean these by hand, mirroring the schema.
-_PROJECT_DEPENDENT_TABLES = ("permission", "workspace", "project_directory")
-
-
-def delete_project_by_worktree(conn: sqlite3.Connection, project_path: str) -> int:
-    """Delete the project row(s) whose worktree matches project_path, plus rows
-    that reference them.
-
-    ``project_path`` must be in OpenCode's forward-slash convention (see
-    :func:`opencode_paths`); the match also accepts OS-native backslash rows.
-    Referencing rows in ``permission`` / ``workspace`` / ``project_directory``
-    are removed explicitly because the declared ``ON DELETE CASCADE`` does not
-    fire on ocsm connections — skipping them leaves rows that fail
-    ``PRAGMA foreign_key_check``. Returns the number of project rows deleted.
-    """
-    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    if "project" not in tables:
-        return 0
-    rows = conn.execute(
-        "SELECT id FROM project WHERE (REPLACE(worktree, '\\', '/') = ? OR worktree = ?)",
-        [project_path, project_path],
-    ).fetchall()
-    if not rows:
-        return 0
-    ids = [r[0] for r in rows]
-    placeholders = ", ".join(["?"] * len(ids))
-    for tbl in _PROJECT_DEPENDENT_TABLES:
-        if tbl in tables:
-            conn.execute(f"DELETE FROM {tbl} WHERE project_id IN ({placeholders})", ids)
-    cursor = conn.execute(f"DELETE FROM project WHERE id IN ({placeholders})", ids)
-    return cursor.rowcount
+# NOTE: no ocsm command removes project rows anymore — ocsm manages conversations
+# per folder, not OpenCode's cross-folder project model, so this is kept only as
+# documentation of the schema relationship (see update_project_worktree for the
+# one place project rows are legitimately rewritten, on folder rename).
 
 
 def reset_project_id_to_global(
@@ -560,14 +534,23 @@ _SESSION_DEPENDENT_TABLES = (
     "session_context_epoch",
 )
 
+# Event tables that key sessions by ``aggregate_id`` instead of ``session_id``
+# (event -> event_sequence, same lifecycle as the session they belong to).
+_SESSION_AGGREGATE_TABLES = ("event", "event_sequence")
+
 
 def delete_session_tree_full(conn: sqlite3.Connection, session_ids: list[str]) -> int:
     """Permanently delete sessions and *all* dependent rows across the schema.
 
     Unlike :func:`delete_session_tree` (which is used for in-place replace and
     deliberately preserves dependent rows), this wipes every table that
-    references ``session.id`` so no orphaned rows are left behind. Safe to call
-    on DBs missing some of the dependent tables: each is table-existence-guarded.
+    references ``session.id`` — directly, or via ``aggregate_id`` for the event
+    tables — so no orphaned rows are left behind. Safe to call on DBs missing
+    some of the dependent tables: each is table-existence-guarded.
+
+    Never touches the project tables (``project`` / ``project_directory`` /
+    ``permission`` / ``workspace``): they describe OpenCode's cross-folder
+    project model, which other directories' sessions may still depend on.
 
     Caller must pass the full id set (root + descendants); deletion order is
     child-first so nothing violates referential integrity. Returns the number of
@@ -575,7 +558,7 @@ def delete_session_tree_full(conn: sqlite3.Connection, session_ids: list[str]) -
     """
     if not session_ids:
         return 0
-    placeholders = ", ".join(["?"] * len(session_ids))
+    placeholders = ", ".join("?" * len(session_ids))
     tables = {row[0] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
     ).fetchall()}
@@ -585,6 +568,12 @@ def delete_session_tree_full(conn: sqlite3.Connection, session_ids: list[str]) -
         if tbl in tables:
             conn.execute(
                 f"DELETE FROM {tbl} WHERE session_id IN ({placeholders})",
+                session_ids,
+            )
+    for tbl in _SESSION_AGGREGATE_TABLES:
+        if tbl in tables:
+            conn.execute(
+                f"DELETE FROM {tbl} WHERE aggregate_id IN ({placeholders})",
                 session_ids,
             )
     cursor = conn.execute(f"DELETE FROM session WHERE id IN ({placeholders})", session_ids)

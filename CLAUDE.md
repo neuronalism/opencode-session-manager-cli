@@ -20,7 +20,7 @@ CLI tool for managing OpenCode sessions stored in SQLite.
 - `uv run ocsm move project --from <old> --to-project <new>` — move sessions
 - `uv run ocsm sync project --from <path>` — two-way sync (DB ↔ `<project>/.opencode/raw_conversations/`), incl. deletions
 - `uv run ocsm export-then-delete session --from <id> --to <dir> | --to-project <path>` — export a session (raw JSON, import-safe) then permanently delete it from the DB
-- `uv run ocsm export-then-delete project --from <path> --to <dir> | --to-project <path>` — export all sessions of a project then permanently delete them (and the project row) from the DB
+- `uv run ocsm export-then-delete project --from <path> --to <dir> | --to-project <path>` — export all sessions of a project then permanently delete them from the DB
 - `uv run ocsm --db <path>` / `OCSM_DB_PATH` — custom database path
 
 ## Project Structure
@@ -81,7 +81,7 @@ Key relationships:
 - **Manifest**: atomic write (tempfile + `os.replace`); records ids present on BOTH sides after sync so a later one-sided removal is detectable. Deleting it resets to first-sync.
 - **Writes**: DB writes go through the same safety pipeline as import (checkpoint + backup + single transaction + rollback). "Update in place" = DELETE + INSERT via `replace_session` (message/part rows may have changed). The folder→DB direction rewrites `directory`/`path` via `opencode_paths` and writes all 29 `SESSION_COLUMNS` — identical handling to `import`, so the same schema/path fixes apply.
 - **Subagents**: a session's direction follows its root, preserving tree integrity.
-- **Deletion cleanup**: deletion propagation to the DB uses `delete_session_tree_full` (NOT `delete_session_tree`), so `part`, `message`, `todo`, `session_message`, `session_input`, `session_share`, `session_context_epoch` are all removed — no orphaned rows. `replace_session` still uses `delete_session_tree` (which preserves those rows) because the same id is re-inserted.
+- **Deletion cleanup**: deletion propagation to the DB uses `delete_session_tree_full` (NOT `delete_session_tree`), so `part`, `message`, `todo`, `session_message`, `session_input`, `session_share`, `session_context_epoch`, and `event`/`event_sequence` (by `aggregate_id`) are all removed — no orphaned rows. `replace_session` still uses `delete_session_tree` (which preserves those rows) because the same id is re-inserted.
 
 ## Export-then-delete
 
@@ -91,6 +91,6 @@ Key relationships:
 - **Format**: `--format raw` (default) writes raw JSON only; `--format markdown` writes **both** raw JSON and markdown. Raw JSON is always written because it is the only re-importable format.
 - **Confirmation gate**: deletion requires re-typing the exact `--from` value (session ID or project path) at an interactive prompt — there is **no `-y` bypass**. Non-TTY invocations abort with an error before any DB change. EOF / Ctrl-C / any mismatch aborts (exported files are kept so the user can retry).
 - **Tree integrity**: `session` exports+deletes the whole tree (root + subagents via `get_session_tree`); `project` BFS-expands every matching root so subagents are included on both sides.
-- **Deletion**: `delete_session_tree_full` (full cascade) +, for `project`, `delete_project_by_worktree` (path normalized via `opencode_paths`, matches either slash form; also removes `permission`/`workspace`/`project_directory` rows referencing the project so `PRAGMA foreign_key_check` stays clean — the `project` row is metadata only; OpenCode recreates it). Single transaction with rollback; backup via `_checkpoint_and_backup` first.
+- **Deletion**: `delete_session_tree_full` (full cascade: `part`/`message`/`session` + `todo`/`session_message`/`session_input`/`session_share`/`session_context_epoch` + `event`/`event_sequence` via `aggregate_id`). **Never touches the project tables** (`project` / `project_directory` / `permission` / `workspace`): ocsm manages conversations per folder, not OpenCode's cross-folder project model — those rows may still be in use by other worktrees' sessions (deleting them orphans every session of the same project living in other directories). Single transaction with rollback; backup via `_checkpoint_and_backup` first.
 - **Vacuum**: `project --vacuum` rebuilds the DB file after the delete transaction via `_vacuum_db` (SQLite DELETE only freelist pages, so the file — and every subsequent `.bak` backup — keeps its pre-delete size until VACUUM). Vacuum failure is non-fatal: the deletion is already committed. Session-level etd has no vacuum flag (usually too small to matter).
 - **Recovery**: the report prints a concrete `ocsm import session --from <exported.json> --to-project <path>` hint plus the backup path.
