@@ -14,7 +14,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from ocsm.db import get_connection, resolve_db_path
+from ocsm.db import default_db_path, get_connection, resolve_db_path
 from ocsm.format import format_projects_list, format_sessions_list, format_sessions_tree, format_timestamp, session_to_markdown, session_to_raw_json
 from ocsm.queries import (
     delete_project_by_worktree,
@@ -448,11 +448,27 @@ def _print_import_plan(plan: dict, substitute: bool, to_project: Path) -> None:
     console.print(f"[dim]Target directory: {new_directory}[/dim]")
 
 
-def _verify_with_opencode(project_dir: Path) -> bool:
+def _verify_with_opencode(project_dir: Path, db_path: Path | None = None) -> bool:
     """Verify DB integrity using opencode db CLI.
+
+    ``opencode db`` has no way to point at an arbitrary database file — it always
+    resolves its own default DB. So when ocsm was invoked with a custom ``--db``,
+    running it would verify (and rw-open) the *wrong* database; skip instead.
 
     Returns True if no errors detected, None if skipped.
     """
+    if db_path is not None:
+        try:
+            default = default_db_path().expanduser().resolve()
+        except Exception:
+            default = None
+        if default is None or db_path != default:
+            console.print(
+                "[dim]Runtime verification skipped: `opencode db` can only reach its default DB, "
+                f"but ocsm is using {db_path}.[/dim]"
+            )
+            return None
+
     opencode = shutil.which("opencode-cli.exe") or shutil.which("opencode-cli") or shutil.which("opencode")
     if not opencode:
         console.print("[yellow]Warning: opencode-cli not found, skipping runtime verification.[/yellow]")
@@ -1137,7 +1153,7 @@ def sync_project_cmd(
 
     # --- Verify (only if DB changed) ---
     if result["db_imported"] or result["db_deleted"]:
-        _verify_with_opencode(project_dir)
+        _verify_with_opencode(project_dir, db_path)
 
 
 def _folder_title(folder_sessions: dict[str, dict], sid: str) -> str | None:
@@ -1601,7 +1617,7 @@ def import_session_cmd(
 
     _import_report(result)
     if result["imported"]:
-        _verify_with_opencode(to_project)
+        _verify_with_opencode(to_project, db_path)
 
 
 @import_app.command("project")
@@ -1677,7 +1693,7 @@ def import_project_cmd(
 
     _import_report(result)
     if result["imported"]:
-        _verify_with_opencode(to_project)
+        _verify_with_opencode(to_project, db_path)
 
 
 @move_app.command("project")
@@ -1779,4 +1795,4 @@ def move_project_cmd(
     console.print(f"\n[dim]Backup: {backup_path}[/dim]")
     console.print("[dim]Delete the backup manually once you confirm everything works.[/dim]")
 
-    _verify_with_opencode(to_project)
+    _verify_with_opencode(to_project, db_path)

@@ -63,7 +63,7 @@ Key relationships:
 2. Full database backup (`opencode.db.bak.<timestamp>`)
 3. Import sessions (skip existing IDs; recompute `session.directory` + `session.path` via `opencode_paths` to OpenCode's forward-slash convention; write all `SESSION_COLUMNS` present in the source dict; insert session → message → part)
 4. Tree integrity validation (all parent-child references verified)
-5. OpenCode runtime verification (`opencode db PRAGMA integrity_check`)
+5. OpenCode runtime verification (`opencode db PRAGMA integrity_check`) — only when ocsm runs against the **default** DB path; `opencode db` cannot target an arbitrary file, so custom `--db` invocations skip verification instead of verifying (and rw-opening) the wrong database.
 6. Report results + backup location (user deletes backup manually)
 
 ## Sync
