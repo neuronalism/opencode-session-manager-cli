@@ -31,6 +31,7 @@ from ocsm.queries import (
     load_messages,
     load_raw_messages,
     opencode_paths,
+    opencode_paths_for,
     replace_session,
     reset_project_id_to_global,
     session_exists,
@@ -314,9 +315,11 @@ def _import_session_tree(
         return {"imported": 0, "skipped": 0, "session_ids": [], "backup_path": None, "old_directory": None}
 
     backup_path = _checkpoint_and_backup(db_path)
-    new_directory, new_path = opencode_paths(to_project)
 
     conn = get_connection(db_path)
+    # Registry-aware: OpenCode stores `path` relative to the nearest registered
+    # directory root (project worktree / project_directory row), not to the drive.
+    new_directory, new_path = opencode_paths_for(conn, to_project)
     try:
         conn.execute("BEGIN")
         imported = []
@@ -812,7 +815,12 @@ def _apply_sync(
     - Returns a summary dict for reporting.
     """
     raw_dir = _raw_dir(project_dir)
-    new_directory, new_path = opencode_paths(project_dir)
+    _conn = get_connection(db_path)
+    try:
+        # Registry-aware: see opencode_paths_for().
+        new_directory, new_path = opencode_paths_for(_conn, project_dir)
+    finally:
+        _conn.close()
 
     to_folder_ids = set(diff["to_folder"])
     to_db_ids = set(diff["to_db"])
@@ -1683,7 +1691,12 @@ def move_project_cmd(
     # OpenCode matches directories by the forward-slash form (see opencode_paths);
     # Path.resolve() yields backslashes on Windows, which no stored value matches.
     old_path, _old_rel = opencode_paths(from_dir)
-    new_path, new_rel = opencode_paths(to_project)
+    _conn = get_connection(db_path)
+    try:
+        # Registry-aware: the new `path` is relative to the nearest registered root.
+        new_path, new_rel = opencode_paths_for(_conn, to_project)
+    finally:
+        _conn.close()
 
     if old_path == new_path:
         console.print("[yellow]Source and destination paths are the same. Nothing to do.[/yellow]")

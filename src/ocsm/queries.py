@@ -40,10 +40,12 @@ def opencode_paths(to_project: Path) -> tuple[str, str]:
       yields backslashes (``D:\\Documents\\foo``), which OpenCode will NOT match, so
       imported sessions become invisible/unopenable. This normalizes to the form
       OpenCode itself writes.
-    - ``path``: the same path with the leading drive/root stripped — e.g.
-      ``Documents/foo``. It is the structural counterpart of ``directory`` and must be
-      recomputed on import (a source export from another machine carries that machine's
-      ``path``, e.g. ``Users/shengw/Documents/foo``), not copied verbatim.
+    - ``path``: the same path relative to the drive/root — e.g. ``Documents/foo``.
+
+    For ``path`` this drive-strip form is only what OpenCode writes for directories
+    it has NOT registered (the ``global`` project's root is ``/``). For directories
+    under a registered root OpenCode writes the path relative to that root instead —
+    see :func:`opencode_paths_for`, which import/move/sync must use.
 
     Both are recomputed unconditionally on import/sync, mirroring how ``directory`` is
     already rewritten. User-facing path text inside ``message``/``part.data`` is handled
@@ -59,6 +61,49 @@ def opencode_paths(to_project: Path) -> tuple[str, str]:
     elif path.startswith("/"):
         path = path[1:]          # drop leading '/' (posix absolute)
     return directory, path
+
+
+def _registered_roots(conn: sqlite3.Connection) -> list[str]:
+    """Directory roots OpenCode has registered: every project worktree plus every
+    ``project_directory`` row (main worktrees and git worktrees)."""
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    roots: list[str] = []
+    if "project" in tables:
+        roots.extend(row[0] for row in conn.execute("SELECT worktree FROM project").fetchall() if row[0])
+    if "project_directory" in tables:
+        roots.extend(row[0] for row in conn.execute("SELECT directory FROM project_directory").fetchall() if row[0])
+    return roots
+
+
+def opencode_paths_for(conn: sqlite3.Connection, to_project: Path) -> tuple[str, str]:
+    """Registry-aware variant of :func:`opencode_paths` — how OpenCode derives ``path`` now.
+
+    Since the project-directory model landed (``project_directory`` +
+    ``project.sandboxes``, OpenCode ~1.18), ``path`` is relative to the nearest
+    registered directory root: a session directly at a registered root stores
+    ``''`` (empty string), a session below it stores the remainder (e.g. worktree
+    ``D:/Code/w/biorxiv`` + session dir ``.../biorxiv/support/x`` → ``support/x``).
+    Only directories no root covers get the drive-strip fallback (the ``global``
+    project's root is ``/``, making the two forms identical there). Verified
+    against live rows: 400/400 recent sessions follow this rule.
+    """
+    directory, fallback = opencode_paths(to_project)
+    best: str | None = None
+    for root in _registered_roots(conn):
+        norm = _normalize_directory(root)
+        if norm == directory:
+            best = norm
+            break
+        # skip bare roots like '/' — they'd shadow every posix path and are the
+        # fallback form anyway
+        if len(norm) > 1 and directory.startswith(norm.rstrip("/") + "/"):
+            if best is None or len(norm) > len(best):
+                best = norm
+    if best is None:
+        return directory, fallback
+    if best == directory:
+        return directory, ""
+    return directory, directory[len(best.rstrip("/")) + 1:]
 
 
 def list_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
