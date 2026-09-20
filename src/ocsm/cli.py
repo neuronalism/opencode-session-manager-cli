@@ -219,6 +219,9 @@ def export_session_cmd(
     try:
         if tree or flat:
             rows = get_session_tree(conn, session_id)
+            if not rows:
+                console.print(f"[yellow]Warning:[/yellow] Session '{session_id}' not found — nothing to export.")
+                raise typer.Exit(1)
         else:
             row = get_session(conn, session_id)
             if row is None:
