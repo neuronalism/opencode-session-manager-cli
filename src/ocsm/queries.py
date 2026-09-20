@@ -370,42 +370,60 @@ def validate_session_tree(conn: sqlite3.Connection, root_id: str) -> list[str]:
     return all_ids
 
 
+def _path_variants(old: str, new: str) -> list[tuple[str, str]]:
+    """Every separator spelling an (old, new) path pair can take inside the data columns.
+
+    ``session.directory`` stores forward slashes, but the paths embedded in the
+    ``message.data`` / ``part.data`` JSON text are written by OpenCode with
+    OS-native backslashes, JSON-escaped — on Windows ``D:/x`` appears in stored
+    text as ``D:\\\\x`` (two literal backslashes per separator). A REPLACE keyed
+    on one spelling never touches the others, so all three forms are generated,
+    each mapping the old path to the *same* form of the new path (double
+    backslashes included) so the JSON text stays valid.
+    """
+    old_fwd = old.replace("\\", "/")
+    new_fwd = new.replace("\\", "/")
+    variants = {
+        (old_fwd, new_fwd),
+        (old_fwd.replace("/", "\\"), new_fwd.replace("/", "\\")),
+        (old_fwd.replace("/", "\\\\"), new_fwd.replace("/", "\\\\")),
+    }
+    return [(o, n) for o, n in variants if o != n]
+
+
 def substitute_paths(conn: sqlite3.Connection, session_ids: list[str], old_path: str, new_path: str) -> dict[str, int]:
     """Replace old_path with new_path in data fields of imported sessions.
 
-    Handles both raw paths (backslashes) and JSON-escaped paths (double backslashes)
-    since data columns store JSON strings where backslashes are escaped.
+    Matches every separator spelling of the path (see :func:`_path_variants`) —
+    the JSON-escaped backslash form is the one OpenCode actually writes into
+    the ``data`` columns on Windows, which a forward-slash pattern alone never
+    matched (5301/5544 messages of a real session tree stayed unreplaced).
 
     Returns dict mapping session_id -> number of rows affected.
     """
     if not session_ids or old_path == new_path:
         return {}
+    variants = _path_variants(old_path, new_path)
+    if not variants:
+        return {}
     placeholders = ", ".join(["?"] * len(session_ids))
-    old_json = old_path.replace("\\", "\\\\")
-    new_json = new_path.replace("\\", "\\\\")
-    # Count affected rows per session_id before replacement
+    # Count affected rows per session_id before replacement; a row counts once
+    # even when it contains several spellings of the old path.
     counts: dict[str, int] = {sid: 0 for sid in session_ids}
     id_col_map = {"message": "session_id", "part": "session_id", "session": "id"}
-    search_patterns = [f"%{old_path}%"]
-    if old_json != old_path:
-        search_patterns.append(f"%{old_json}%")
     for table, col in [("message", "data"), ("part", "data"), ("session", "summary_diffs")]:
         id_col = id_col_map[table]
-        for pattern in search_patterns:
-            for row in conn.execute(
-                f"SELECT {id_col}, COUNT(*) FROM {table} WHERE {col} LIKE ? AND {id_col} IN ({placeholders}) GROUP BY {id_col}",
-                [pattern] + session_ids,
-            ):
-                counts[row[0]] += row[1]
-    for table, col, id_col in [("message", "data", "session_id"), ("part", "data", "session_id"), ("session", "summary_diffs", "id")]:
-        conn.execute(
-            f"UPDATE {table} SET {col} = REPLACE({col}, ?, ?) WHERE {id_col} IN ({placeholders})",
-            [old_path, new_path] + session_ids,
-        )
-        if old_json != old_path:
+        like_clause = " OR ".join(f"{col} LIKE ?" for _ in variants)
+        for row in conn.execute(
+            f"SELECT {id_col}, COUNT(*) FROM {table} "
+            f"WHERE ({like_clause}) AND {id_col} IN ({placeholders}) GROUP BY {id_col}",
+            [f"%{old}%" for old, _ in variants] + session_ids,
+        ):
+            counts[row[0]] += row[1]
+        for old_var, new_var in variants:
             conn.execute(
                 f"UPDATE {table} SET {col} = REPLACE({col}, ?, ?) WHERE {id_col} IN ({placeholders})",
-                [old_json, new_json] + session_ids,
+                [old_var, new_var] + session_ids,
             )
     return {sid: c for sid, c in counts.items() if c > 0}
 
