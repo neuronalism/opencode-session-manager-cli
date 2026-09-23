@@ -54,14 +54,14 @@ Key relationships:
 - Raw default dir: `<project>/.opencode/raw_conversations/`
 - Project dir missing → fallback to `cwd`
 - Project references use `--project <path>` (directory path) — always unique
-- `project_id` is derived from git root commit hash (not directory basename); OpenCode fixes `'global'` automatically on startup
+- `project_id`: import/move/sync stamp it via `resolve_project_id` — the nearest registered root (`project.worktree` / `project_directory.directory`) covering the target directory wins; unregistered dirs get `'global'`, which is the correct id there. Never rely on OpenCode's startup repair: its global→id sweep (`fromDirectory`) only matches sessions sitting *exactly* at a worktree root, so a `'global'` session in a worktree subdir stays `'global'` forever and is invisible in the project session list (listing filters on `project_id`). For reference, OpenCode's own id algorithm: sha1(`git-remote:host/path`) of the **origin** remote > cached `<git-dir>/opencode` file > first root-commit hash > `'global'` for non-git dirs (verified against live rows; a repo whose remote is not named `origin` falls through to cache/root-commit).
 - Windows: Console initialized with `legacy_windows=False` + UTF-8 wrapper to handle CJK/emoji
 
 ## Import Safety Pipeline
 
 1. SQLite WAL checkpoint (`PRAGMA wal_checkpoint(TRUNCATE)`)
 2. Full database backup (`opencode.db.bak.<timestamp>`)
-3. Import sessions (skip existing IDs; recompute `session.directory` + `session.path` via `opencode_paths` to OpenCode's forward-slash convention; write all `SESSION_COLUMNS` present in the source dict; insert session → message → part)
+3. Import sessions (skip existing IDs; recompute `session.directory` + `session.path` via `opencode_paths_for` to OpenCode's forward-slash convention; stamp `project_id` via `resolve_project_id`; write all `SESSION_COLUMNS` present in the source dict; insert session → message → part)
 4. Tree integrity validation (all parent-child references verified)
 5. OpenCode runtime verification (`opencode db PRAGMA integrity_check`) — only when ocsm runs against the **default** DB path; `opencode db` cannot target an arbitrary file, so custom `--db` invocations skip verification instead of verifying (and rw-opening) the wrong database.
 6. Report results + backup location (user deletes backup manually)
@@ -79,7 +79,7 @@ Key relationships:
 - **Conflicts**: `--on-conflict ask` (interactive, requires TTY; else abort) | `newer` | `skip`.
 - **Deletion propagation**: only when manifest exists; **first sync never deletes**. Whole-tree (root removal cascades to subagents). Confirmed interactively (default N) unless `-y`; skipped in non-interactive mode without `-y`.
 - **Manifest**: atomic write (tempfile + `os.replace`); records ids present on BOTH sides after sync so a later one-sided removal is detectable. Deleting it resets to first-sync.
-- **Writes**: DB writes go through the same safety pipeline as import (checkpoint + backup + single transaction + rollback). "Update in place" = DELETE + INSERT via `replace_session` (message/part rows may have changed). The folder→DB direction rewrites `directory`/`path` via `opencode_paths` and writes all 29 `SESSION_COLUMNS` — identical handling to `import`, so the same schema/path fixes apply.
+- **Writes**: DB writes go through the same safety pipeline as import (checkpoint + backup + single transaction + rollback). "Update in place" = DELETE + INSERT via `replace_session` (message/part rows may have changed). The folder→DB direction rewrites `directory`/`path` via `opencode_paths_for`, stamps `project_id` via `resolve_project_id`, and writes all 29 `SESSION_COLUMNS` — identical handling to `import`, so the same schema/path fixes apply.
 - **Subagents**: a session's direction follows its root, preserving tree integrity.
 - **Deletion cleanup**: deletion propagation to the DB uses `delete_session_tree_full` (NOT `delete_session_tree`), so `part`, `message`, `todo`, `session_message`, `session_input`, `session_share`, `session_context_epoch`, and `event`/`event_sequence` (by `aggregate_id`) are all removed — no orphaned rows. `replace_session` still uses `delete_session_tree` (which preserves those rows) because the same id is re-inserted.
 

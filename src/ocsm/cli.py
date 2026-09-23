@@ -32,8 +32,9 @@ from ocsm.queries import (
     opencode_paths,
     opencode_paths_for,
     replace_session,
-    reset_project_id_to_global,
+    resolve_project_id,
     session_exists,
+    set_session_project_id,
     substitute_paths,
     update_project_worktree,
     update_session_directory,
@@ -322,6 +323,9 @@ def _import_session_tree(
     # Registry-aware: OpenCode stores `path` relative to the nearest registered
     # directory root (project worktree / project_directory row), not to the drive.
     new_directory, new_path = opencode_paths_for(conn, to_project)
+    # Same registry decides the project id — 'global' only for unregistered dirs
+    # (OpenCode's startup repair never reaches sessions below a worktree root).
+    new_project_id = resolve_project_id(conn, str(to_project))
     try:
         conn.execute("BEGIN")
         imported = []
@@ -346,7 +350,7 @@ def _import_session_tree(
 
             session["directory"] = new_directory
             session["path"] = new_path
-            session["project_id"] = "global"
+            session["project_id"] = new_project_id
 
             insert_session(conn, session)
             insert_messages(conn, messages)
@@ -377,6 +381,7 @@ def _import_session_tree(
         "backup_path": backup_path,
         "old_directory": old_directory,
         "path_sub_counts": path_sub_counts,
+        "project_id": new_project_id,
     }
 
 
@@ -387,7 +392,8 @@ def _plan_import(db_path: Path, tree_data: list[dict], to_project: Path) -> dict
     subagents whose parent isn't in this batch, skip ids already in the DB)
     but performs only SELECTs — no transaction, no checkpoint, no backup.
 
-    Returns {"imported": [...], "skipped": [...], "old_directory": str|None}.
+    Returns {"imported": [...], "skipped": [...], "old_directory": str|None,
+    "project_id": str}.
     """
     imported: list[str] = []
     skipped: list[str] = []
@@ -396,6 +402,7 @@ def _plan_import(db_path: Path, tree_data: list[dict], to_project: Path) -> dict
 
     conn = get_connection(db_path)
     try:
+        project_id = resolve_project_id(conn, str(to_project))
         for data in tree_data:
             session, _messages, _parts = _validate_raw_json(data)
 
@@ -420,7 +427,16 @@ def _plan_import(db_path: Path, tree_data: list[dict], to_project: Path) -> dict
         "imported": imported,
         "skipped": skipped,
         "old_directory": old_directory,
+        "project_id": project_id,
     }
+
+
+def _project_id_hint(project_id: str, *, future: bool = False) -> str:
+    """One-line explanation of the project_id stamped on imported/moved sessions."""
+    verb = "would be set to" if future else "set to"
+    if project_id == "global":
+        return f"project_id {verb} 'global' — the target directory is not registered as a project"
+    return f"project_id {verb} '{project_id}' — the registered project covering the target directory"
 
 
 def _print_import_plan(plan: dict, substitute: bool, to_project: Path) -> None:
@@ -431,7 +447,7 @@ def _print_import_plan(plan: dict, substitute: bool, to_project: Path) -> None:
 
     if imported:
         console.print(f"[green]Would import {len(imported)} session(s):[/green]")
-        console.print("[dim]  project_id would be reset to 'global' — OpenCode assigns the correct ID on next startup[/dim]")
+        console.print(f"[dim]  {_project_id_hint(plan.get('project_id', 'global'), future=True)}[/dim]")
         for sid in imported:
             console.print(f"  {sid}")
     if skipped:
@@ -522,7 +538,7 @@ def _import_report(result: dict) -> None:
     """Print import results to console."""
     if result["imported"]:
         console.print(f"[green]Imported {len(result['imported'])} session(s):[/green]")
-        console.print("[dim]  project_id reset to 'global' — OpenCode will assign the correct ID on next startup[/dim]")
+        console.print(f"[dim]  {_project_id_hint(result.get('project_id', 'global'))}[/dim]")
         for sid in result["imported"]:
             console.print(f"  {sid}")
     if result["skipped"]:
@@ -837,6 +853,8 @@ def _apply_sync(
     try:
         # Registry-aware: see opencode_paths_for().
         new_directory, new_path = opencode_paths_for(_conn, project_dir)
+        # Same registry decides the project id (see _import_session_tree).
+        new_project_id = resolve_project_id(_conn, str(project_dir))
     finally:
         _conn.close()
 
@@ -934,7 +952,7 @@ def _apply_sync(
                     old_directory = session.get("directory")
                 session["directory"] = new_directory
                 session["path"] = new_path
-                session["project_id"] = "global"
+                session["project_id"] = new_project_id
                 replace_session(conn, session, messages, parts)
                 imported_ids.append(sid)
                 db_imported.append(sid)
@@ -975,6 +993,7 @@ def _apply_sync(
         "db_deleted": db_deleted,
         "backup_path": backup_path,
         "path_sub_counts": path_sub_counts,
+        "project_id": new_project_id,
     }
 
 
@@ -1202,7 +1221,7 @@ def _sync_report(result: dict) -> None:
             console.print(f"  + {sid}")
     if di:
         console.print(f"[cyan]folder -> DB: imported {len(di)} session(s)[/cyan]")
-        console.print("[dim]  project_id reset to 'global' — OpenCode will assign the correct ID on next startup[/dim]")
+        console.print(f"[dim]  {_project_id_hint(result.get('project_id', 'global'))}[/dim]")
         for sid in di:
             console.print(f"  + {sid}")
     if fd:
@@ -1712,7 +1731,11 @@ def move_project_cmd(
     _conn = get_connection(db_path)
     try:
         # Registry-aware: the new `path` is relative to the nearest registered root.
-        new_path, new_rel = opencode_paths_for(_conn, to_project)
+        # Only the directory form is needed this early (same-path check, target
+        # listing); `path`/`project_id` are derived inside the transaction, AFTER
+        # update_project_worktree, so moving a registered directory sees its own
+        # just-renamed registration instead of the unregistered fallbacks.
+        new_path, _ = opencode_paths_for(_conn, to_project)
     finally:
         _conn.close()
 
@@ -1758,9 +1781,13 @@ def move_project_cmd(
     conn = get_connection(db_path)
     try:
         conn.execute("BEGIN")
-        dir_updated = update_session_directory(conn, session_ids, old_path, new_path, new_rel)
         project_updated = update_project_worktree(conn, old_path, new_path)
-        pid_reset = reset_project_id_to_global(conn, session_ids)
+        # Derive AFTER the worktree rename above, so moving a registered project
+        # directory resolves against its own (just-renamed) registration.
+        new_rel = opencode_paths_for(conn, to_project)[1]
+        new_pid = resolve_project_id(conn, str(to_project))
+        dir_updated = update_session_directory(conn, session_ids, old_path, new_path, new_rel)
+        pid_reset = set_session_project_id(conn, session_ids, new_pid)
         path_sub_counts = substitute_paths(conn, session_ids, old_path, new_path)
         conn.commit()
     except Exception:
@@ -1783,7 +1810,12 @@ def move_project_cmd(
             "stored directory form; their directory was left unchanged.[/yellow]"
         )
     if pid_reset:
-        console.print(f"  session.project_id reset to 'global': {pid_reset} row(s) [dim]— OpenCode will assign the correct ID on next startup[/dim]")
+        where = (
+            "the registered project covering the target directory"
+            if new_pid != "global"
+            else "the target directory is not registered as a project"
+        )
+        console.print(f"  session.project_id set to '{new_pid}': {pid_reset} row(s) [dim]— {where}[/dim]")
     if project_updated:
         console.print(f"  project.worktree updated: {project_updated} row(s)")
     total_data = sum(path_sub_counts.values())

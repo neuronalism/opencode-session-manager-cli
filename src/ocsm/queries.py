@@ -502,19 +502,51 @@ def update_project_worktree(conn: sqlite3.Connection, old_path: str, new_path: s
 # one place project rows are legitimately rewritten, on folder rename).
 
 
-def reset_project_id_to_global(
-    conn: sqlite3.Connection, session_ids: list[str]
-) -> int:
-    """Reset project_id to 'global' for the given sessions.
+def resolve_project_id(conn: sqlite3.Connection, directory: str) -> str:
+    """Return the project_id OpenCode has registered for ``directory``, or ``"global"``.
 
-    Used during move/import so OpenCode can re-assign the correct ID on startup.
+    OpenCode stamps a session's project id at creation time; its startup repair
+    (project.ts ``fromDirectory``) only re-assigns sessions sitting *exactly* at
+    a worktree root (``WHERE project_id='global' AND directory=<worktree root>``).
+    Sessions written below a registered root would therefore keep ``global``
+    forever — and the project session list filters on ``project_id``, making
+    them invisible. So ocsm resolves the id itself, using the same nearest-root
+    rule as :func:`opencode_paths_for`: the closest ``project_directory`` /
+    ``project.worktree`` root covering the directory wins. Directories no root
+    covers get ``global``, which is the correct id there (OpenCode's own
+    sessions in unregistered dirs stay ``global`` too).
+    """
+    target = _normalize_directory(directory)
+    best: tuple[str, str] | None = None  # (normalized root, project_id)
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    candidates: list[tuple[str, str]] = []
+    if "project" in tables:
+        candidates.extend((r[0], r[1]) for r in conn.execute("SELECT worktree, id FROM project").fetchall() if r[0])
+    if "project_directory" in tables:
+        candidates.extend((r[0], r[1]) for r in conn.execute("SELECT directory, project_id FROM project_directory").fetchall() if r[0])
+    for root, pid in candidates:
+        norm = _normalize_directory(root)
+        # skip bare roots like '/' (the global project) — they would match every
+        # posix path, and 'global' is the fallback anyway
+        if len(norm) > 1 and (norm == target or target.startswith(norm.rstrip("/") + "/")):
+            if best is None or len(norm) > len(best[0]):
+                best = (norm, pid)
+    return best[1] if best else "global"
+
+
+def set_session_project_id(conn: sqlite3.Connection, session_ids: list[str], project_id: str) -> int:
+    """Set project_id for the given sessions (see :func:`resolve_project_id`).
+
+    Used by ``move`` so the moved sessions carry the *target* directory's
+    project id instead of the source's. Import/sync set the id on the session
+    dict before insert and don't go through this helper.
     """
     if not session_ids:
         return 0
     placeholders = ", ".join(["?"] * len(session_ids))
     cursor = conn.execute(
-        f"UPDATE session SET project_id = 'global' WHERE id IN ({placeholders})",
-        session_ids,
+        f"UPDATE session SET project_id = ? WHERE id IN ({placeholders})",
+        [project_id] + session_ids,
     )
     return cursor.rowcount
 

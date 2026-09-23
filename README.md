@@ -208,7 +208,7 @@ Options for syncing:
   - `newer`: the copy with the larger `time_updated` wins (tie → skip).
   - `skip`: leave both copies untouched.
 - **Deletion propagation**: if a session the manifest remembers later vanishes from one side, `sync` removes it from the other. **The first sync (no manifest) never deletes** — every session is treated as new; deleting the manifest resets to that safe behavior. Deletions are whole-tree (removing a root session removes its subagents) and are confirmed interactively (default `N`) unless `-y` is given.
-- **Safety**: DB writes reuse the same pipeline as `import` — WAL checkpoint + timestamped `.bak` backup + single transaction with rollback. Updating an existing session is done as DELETE + INSERT (its messages/parts may have changed). Imported `project_id` is reset to `global` so OpenCode reassigns it on startup.
+- **Safety**: DB writes reuse the same pipeline as `import` — WAL checkpoint + timestamped `.bak` backup + single transaction with rollback. Updating an existing session is done as DELETE + INSERT (its messages/parts may have changed). Imported `project_id` is stamped with the registered project covering the target directory (nearest `project.worktree` / `project_directory` root), falling back to `global` only for unregistered directories.
 - **No content merge**: a session is always taken wholesale from one side — `sync` never merges messages field-by-field.
 
 > [!NOTE]
