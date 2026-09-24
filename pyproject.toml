@@ -1,6 +1,6 @@
 [project]
 name = "ocsm"
-version = "0.4.1"
+version = "0.4.2"
 description = "OpenCode Sessions Manager CLI"
 requires-python = ">=3.10"
 dependencies = [
