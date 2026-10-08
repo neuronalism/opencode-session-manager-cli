@@ -17,6 +17,7 @@ from rich.console import Console
 from ocsm.db import default_db_path, get_connection, resolve_db_path
 from ocsm.format import format_projects_list, format_sessions_list, format_sessions_tree, format_timestamp, session_to_markdown, session_to_raw_json
 from ocsm.queries import (
+    TODO_COLUMNS,
     delete_session_tree,
     delete_session_tree_full,
     get_session,
@@ -25,10 +26,12 @@ from ocsm.queries import (
     insert_messages,
     insert_parts,
     insert_session,
+    insert_todos,
     list_projects,
     list_sessions,
     load_messages,
     load_raw_messages,
+    load_raw_todos,
     opencode_paths,
     opencode_paths_for,
     replace_session,
@@ -174,7 +177,8 @@ def _export_sessions(
 
         if is_raw:
             raw = load_raw_messages(conn, sid)
-            content = session_to_raw_json(dict(row), raw)
+            todos = load_raw_todos(conn, sid)
+            content = session_to_raw_json(dict(row), raw, todos)
         else:
             messages = load_messages(conn, sid)
             content = session_to_markdown(dict(row), messages, thinking=thinking, tool_calls=tool_calls)
@@ -260,6 +264,37 @@ def _load_raw_file(path: Path) -> dict:
         raise ValueError(f"Failed to read raw JSON file '{path}': {e}")
 
 
+def _extract_todos(data: dict) -> list | None:
+    """Return the raw JSON's ``todos`` list, or None for pre-todo export files.
+
+    Absent key = old format: callers must leave the DB's todo rows untouched.
+    An empty list is a deliberate empty snapshot and DOES overwrite.
+    """
+    todos = data.get("todos")
+    return todos if isinstance(todos, list) else None
+
+
+def _filter_todo_rows(todos: list, source: str) -> list[dict]:
+    """Keep only rows with every TODO column present and non-None.
+
+    Every todo column is NOT NULL without a DB default, so an incomplete row
+    would abort the whole transaction — todos are auxiliary state, so warn and
+    skip the row instead of failing the import. Values are not validated beyond
+    completeness (status/priority are copied verbatim; OpenCode also has a
+    'cancelled' status this DB has never seen).
+    """
+    valid: list[dict] = []
+    for i, row in enumerate(todos):
+        if isinstance(row, dict) and all(row.get(c) is not None for c in TODO_COLUMNS):
+            valid.append(row)
+        else:
+            console.print(
+                f"[yellow]Warning:[/yellow] skipping invalid todo row #{i} in {source} "
+                "(missing NOT NULL field)"
+            )
+    return valid
+
+
 def _find_tree_children(json_file: Path, root_id: str) -> list[dict]:
     """Auto-detect subagent JSON files from tree or flat layout."""
     json_dir = json_file.parent
@@ -315,7 +350,7 @@ def _import_session_tree(
 ) -> dict:
     """Import a session tree into the database."""
     if not tree_data:
-        return {"imported": 0, "skipped": 0, "session_ids": [], "backup_path": None, "old_directory": None}
+        return {"imported": 0, "skipped": 0, "session_ids": [], "backup_path": None, "old_directory": None, "todo_counts": {}}
 
     backup_path = _checkpoint_and_backup(db_path)
 
@@ -332,6 +367,7 @@ def _import_session_tree(
         skipped = []
         imported_ids = []
         old_directory = None
+        todo_counts: dict[str, int] = {}
 
         for data in tree_data:
             session, messages, parts = _validate_raw_json(data)
@@ -355,6 +391,11 @@ def _import_session_tree(
             insert_session(conn, session)
             insert_messages(conn, messages)
             insert_parts(conn, parts, messages=messages)
+            todos = _extract_todos(data)
+            if todos is not None:  # absent key = pre-todo export: don't touch the todo table
+                n_todo = insert_todos(conn, session["id"], _filter_todo_rows(todos, f"session {session['id']}"))
+                if n_todo:
+                    todo_counts[session["id"]] = n_todo
             imported.append(session["id"])
             imported_ids.append(session["id"])
 
@@ -382,6 +423,7 @@ def _import_session_tree(
         "old_directory": old_directory,
         "path_sub_counts": path_sub_counts,
         "project_id": new_project_id,
+        "todo_counts": todo_counts,
     }
 
 
@@ -399,6 +441,7 @@ def _plan_import(db_path: Path, tree_data: list[dict], to_project: Path) -> dict
     skipped: list[str] = []
     planned_ids: list[str] = []  # ids counted as 'present' (newly imported or pre-existing)
     old_directory = None
+    todo_count = 0
 
     conn = get_connection(db_path)
     try:
@@ -420,6 +463,9 @@ def _plan_import(db_path: Path, tree_data: list[dict], to_project: Path) -> dict
 
             imported.append(session["id"])
             planned_ids.append(session["id"])
+            todos = _extract_todos(data)
+            if todos is not None:
+                todo_count += len(_filter_todo_rows(todos, f"session {session['id']}"))
     finally:
         conn.close()
 
@@ -428,6 +474,7 @@ def _plan_import(db_path: Path, tree_data: list[dict], to_project: Path) -> dict
         "skipped": skipped,
         "old_directory": old_directory,
         "project_id": project_id,
+        "todo_count": todo_count,
     }
 
 
@@ -463,6 +510,8 @@ def _print_import_plan(plan: dict, substitute: bool, to_project: Path) -> None:
         console.print(f"\n[cyan]Would substitute paths: '{old_directory}' -> '{new_directory}'[/cyan]")
     elif substitute:
         console.print("\n[dim]Path substitution: no source directory to substitute.[/dim]")
+    if plan.get("todo_count"):
+        console.print(f"[dim]Would restore {plan['todo_count']} todo row(s)[/dim]")
     console.print(f"[dim]Target directory: {new_directory}[/dim]")
 
 
@@ -554,6 +603,10 @@ def _import_report(result: dict) -> None:
         console.print(f"\n[cyan]Path substitution: {total} row(s) updated in {len(path_counts)} session(s)[/cyan]")
         for sid, count in path_counts.items():
             console.print(f"  {sid}: {count} row(s)")
+    todo_counts = result.get("todo_counts", {})
+    if todo_counts:
+        total = sum(todo_counts.values())
+        console.print(f"[cyan]Todo snapshots restored: {total} row(s) across {len(todo_counts)} session(s)[/cyan]")
     if result["backup_path"]:
         console.print(f"\n[dim]Backup: {result['backup_path']}[/dim]")
         console.print("[dim]Delete the backup manually once you confirm everything works.[/dim]")
@@ -876,7 +929,8 @@ def _apply_sync(
                 if row is None:
                     continue
                 raw = load_raw_messages(conn, sid)
-                content = session_to_raw_json(dict(row), raw)
+                todos = load_raw_todos(conn, sid)
+                content = session_to_raw_json(dict(row), raw, todos)
                 # tree layout for subagents
                 pid = row["parent_id"]
                 if pid:
@@ -927,6 +981,7 @@ def _apply_sync(
     db_imported: list[str] = []
     db_deleted: list[str] = []
     path_sub_counts: dict[str, int] = {}
+    todo_counts: dict[str, int] = {}
     backup_path: Path | None = None
 
     db_needs_write = bool(to_db_ids or (do_delete and delete_from_db_ids))
@@ -954,6 +1009,14 @@ def _apply_sync(
                 session["path"] = new_path
                 session["project_id"] = new_project_id
                 replace_session(conn, session, messages, parts)
+                # Snapshot-overwrite: a JSON carrying a `todos` key is authoritative
+                # for the todo list (mirrors OpenCode's delete-all + reinsert); a
+                # file WITHOUT the key is a pre-todo export — keep the DB's rows.
+                todos = _extract_todos(data)
+                if todos is not None:
+                    n_todo = insert_todos(conn, sid, _filter_todo_rows(todos, f"session {sid}"))
+                    if n_todo:
+                        todo_counts[sid] = n_todo
                 imported_ids.append(sid)
                 db_imported.append(sid)
 
@@ -994,6 +1057,7 @@ def _apply_sync(
         "backup_path": backup_path,
         "path_sub_counts": path_sub_counts,
         "project_id": new_project_id,
+        "todo_counts": todo_counts,
     }
 
 
@@ -1238,6 +1302,10 @@ def _sync_report(result: dict) -> None:
     if counts:
         total = sum(counts.values())
         console.print(f"\n[cyan]Path substitution: {total} row(s) updated in {len(counts)} session(s)[/cyan]")
+    todo_counts = result.get("todo_counts", {})
+    if todo_counts:
+        total = sum(todo_counts.values())
+        console.print(f"[cyan]Todo snapshots restored: {total} row(s) across {len(todo_counts)} session(s)[/cyan]")
     if result["backup_path"]:
         console.print(f"\n[dim]Backup: {result['backup_path']}[/dim]")
         console.print("[dim]Delete the backup manually once you confirm everything works.[/dim]")

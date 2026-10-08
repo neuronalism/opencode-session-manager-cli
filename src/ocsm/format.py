@@ -141,11 +141,17 @@ def session_to_json(session: dict, messages: list) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
 
 
-def session_to_raw_json(session_row: dict, raw: dict) -> str:
-    """Export session, messages, and parts as faithful table snapshots for re-import."""
+def session_to_raw_json(session_row: dict, raw: dict, todos: list[dict] | None = None) -> str:
+    """Export session, messages, parts, and the todo snapshot for re-import.
+
+    The ``todos`` key is always present in new exports (``[]`` = deliberately
+    empty snapshot). Files without the key are pre-0.5.0 exports — import treats
+    them as "don't touch the DB's todo rows".
+    """
     payload = {
         "session": session_row,
         "messages": raw["messages"],
         "parts": raw["parts"],
+        "todos": todos if todos is not None else [],
     }
     return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"

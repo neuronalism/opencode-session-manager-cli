@@ -251,6 +251,26 @@ def load_raw_messages(conn: sqlite3.Connection, session_id: str) -> dict:
     }
 
 
+def load_raw_todos(conn: sqlite3.Connection, session_id: str) -> list[dict]:
+    """Load a session's todo rows as raw dicts, position-ordered.
+
+    OpenCode stores todos as a whole-list snapshot: every todowrite deletes the
+    session's rows and re-inserts the list by position, so this IS the todo
+    list — there is no append history and no event table to rebuild on import.
+    """
+    cols = ", ".join(TODO_COLUMNS)
+    rows = conn.execute(
+        f"""
+        SELECT {cols}
+        FROM todo
+        WHERE session_id = ?
+        ORDER BY position ASC
+        """,
+        (session_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_session_tree(conn: sqlite3.Connection, session_id: str) -> list[sqlite3.Row]:
     """Return the root session and all its descendants, breadth-first."""
     all_ids: list[str] = [session_id]
@@ -291,6 +311,12 @@ SESSION_COLUMNS = [
 MESSAGE_COLUMNS = ["id", "session_id", "time_created", "time_updated", "data"]
 
 PART_COLUMNS = ["id", "message_id", "session_id", "time_created", "time_updated", "data"]
+
+# Column set of the `todo` table (composite PK: session_id + position). Kept in
+# sync with PRAGMA table_info(todo) like SESSION_COLUMNS. Every column is NOT
+# NULL with no DB default, so rows coming from raw JSON must be complete before
+# insert (cli-side filtering handles that — see _filter_todo_rows).
+TODO_COLUMNS = ["session_id", "content", "status", "priority", "position", "time_created", "time_updated"]
 
 
 def session_exists(conn: sqlite3.Connection, session_id: str) -> bool:
@@ -346,6 +372,31 @@ def insert_parts(conn: sqlite3.Connection, parts: list[dict], messages: list[dic
                 row.append(None)
         rows.append(tuple(row))
     conn.executemany(f"INSERT INTO part ({col_names}) VALUES ({placeholders})", rows)
+    return len(rows)
+
+
+def insert_todos(conn: sqlite3.Connection, session_id: str, rows: list[dict]) -> int:
+    """Replace a session's todo rows with the given snapshot (caller-filtered).
+
+    Mirrors OpenCode's SessionTodo.update(): delete every row for the session,
+    then re-insert the list verbatim. Delete-first makes it idempotent and immune
+    to the (session_id, position) composite PK. ``position`` values are kept as
+    exported (no renumbering — the source PK guarantees uniqueness); ``session_id``
+    is forced to the argument so a hand-edited JSON cannot plant rows on another
+    session. Returns the number of rows inserted.
+    """
+    conn.execute("DELETE FROM todo WHERE session_id = ?", (session_id,))
+    if not rows:
+        return 0
+    placeholders = ", ".join(["?"] * len(TODO_COLUMNS))
+    col_names = ", ".join(TODO_COLUMNS)
+    conn.executemany(
+        f"INSERT INTO todo ({col_names}) VALUES ({placeholders})",
+        [
+            tuple(session_id if c == "session_id" else row[c] for c in TODO_COLUMNS)
+            for row in rows
+        ],
+    )
     return len(rows)
 
 
