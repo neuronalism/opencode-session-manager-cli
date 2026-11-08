@@ -1,97 +1,107 @@
 # OpenCode Sessions Manager (ocsm)
 
-CLI tool for managing OpenCode sessions stored in SQLite.
+CLI tool for managing OpenCode **2.x** sessions stored in SQLite. Source of
+truth: OpenCode **2.2.5** sources at `D:\Code\opencode-src\opencode-2.2.5`
+(`packages/core/src`: `session/sql.ts`, `session/projector.ts`,
+`session/transfer.ts`, `project.ts`, `bus.ts`, `database/path.ts`).
+
+**Scope rule (v2)**: ocsm reads and writes ONLY the v2 tables. The legacy
+`session` / `message` / `part` / `todo` / `session_share` tables and the
+deprecated `project_directory` table are never touched — OpenCode's runtime
+ignores them once its one-shot `v1-migration` completes, and the v1→v2
+migration itself is OpenCode's job, not ocsm's. v1-format export files
+(pre-0.6.0) are rejected with a pointer to the `v1` branch.
 
 ## Commands
 
-- `uv run ocsm list project` — list all projects (grouped by directory)
-- `uv run ocsm list session` — list root sessions
-- `uv run ocsm list session --project <path>` — filter by project directory
-- `uv run ocsm list session --flat` — include subagent sessions (flat)
-- `uv run ocsm list session --tree` — include subagent sessions (tree)
-- `uv run ocsm export session --from <id>` — export as markdown
-- `uv run ocsm export session --from <id> --format raw` — export as raw JSON (import-safe)
-- `uv run ocsm export session --from <id> --tree` / `--flat` — export with subagents
-- `uv run ocsm export project --from <path>` — export all sessions of a project
-- `uv run ocsm export session --from <id> --dry-run` / `export project --from <path> --dry-run` — preview target paths, write nothing
-- `uv run ocsm import session --from <json> --to-project <path>` — import a session tree from raw JSON (path substitution on by default)
-- `uv run ocsm import project --from <dir> --to-project <path>` — import all sessions from a project's raw export
-- `uv run ocsm import session --from <json> --to-project <path> --dry-run` / `import project ... --dry-run` — preview what would be imported (no DB writes, no backup)
-- `uv run ocsm move project --from <old> --to-project <new>` — move sessions
-- `uv run ocsm sync project --from <path>` — two-way sync (DB ↔ `<project>/.opencode/raw_conversations/`), incl. deletions
-- `uv run ocsm export-then-delete session --from <id> --to <dir> | --to-project <path>` — export a session (raw JSON, import-safe) then permanently delete it from the DB
-- `uv run ocsm export-then-delete project --from <path> --to <dir> | --to-project <path>` — export all sessions of a project then permanently delete them from the DB
+- `uv run ocsm list project` — list projects (id, vcs, worktree, counts)
+- `uv run ocsm list session [--project <path-or-id>] [--flat|--tree]` — root sessions by default; subagents need `--flat`/`--tree`
+- `uv run ocsm verify` — SQL-level health check (integrity, FKs, orphans, `event_sequence` watermarks); replaces the removed `opencode db`
+- `uv run ocsm export session --from <id> [--format markdown|json|raw] [--tree|--flat] [--to <dir>|--to-project <path>] [--dry-run]`
+- `uv run ocsm export project --from <path-or-id> [...]` — all sessions of a project
+- `uv run ocsm import session --file <json> --directory <dir> [--dry-run]` — import one raw payload; `directory` (default cwd) is the destination project
+- `uv run ocsm import project --from-dir <dir> --directory <dir> [--dry-run]` — batch import (parent chains resolved by deferring children)
+- `uv run ocsm move project --from <old-path-or-id> --to <new-dir> [--dry-run]` — re-place a project's sessions
+- `uv run ocsm sync project --project <path-or-id> [--on-conflict ask|newer|skip] [--no-delete] [-y] [--dry-run]`
+- `uv run ocsm export-then-delete session --from <id> --to <dir>|--to-project <path> [--dry-run]`
+- `uv run ocsm export-then-delete project --from <path-or-id> --to <dir> [--vacuum] [--dry-run]`
 - `uv run ocsm --db <path>` / `OCSM_DB_PATH` — custom database path
+- Python via `uv run python` / `uv run ocsm` only (PATH `python` may be the Store placeholder)
 
 ## Project Structure
 
 ```
 src/ocsm/
-  cli.py       # typer commands, all CLI entry points
-  db.py        # database path resolution (XDG_DATA_HOME aware)
-  queries.py   # SQL queries, data loading (load_messages for markdown, load_raw_messages for raw)
-  format.py    # rich text output (list/tree) and export serialization (markdown/raw JSON)
+  cli.py         # assembly: global --db, verify command, mounts the six subapps
+  db.py          # path resolution (XDG_DATA_HOME aware) + FK/busy_timeout connection
+  projectid.py   # Project.resolve replication (project identity algorithm)
+  queries.py     # v2 storage layer: ALL SQL lives here
+  format.py      # rich output + markdown/json/raw serialization
+  common.py      # console, confirmation gates, shared export walker
+  cmd_list.py / cmd_export.py / cmd_import.py / cmd_move.py / cmd_sync.py / cmd_etd.py
 ```
 
-## Database
+## Database (v2 map)
 
-SQLite at `{XDG_DATA_HOME}/opencode/opencode.db`. Tables: `session`, `message`, `part`, `project`.
+`{XDG_DATA_HOME}/opencode/opencode.db`:
 
-Key relationships:
-- `session.parent_id` → parent session (null = root, non-null = subagent)
-- `message.session_id` → session
-- `part.message_id` → message, `part.session_id` → session
+- `session_v2` — 37-column session rows (real column order from `PRAGMA table_info`; `fork_session_id`/`time_suspended`/`idle_outcome`/`resume_attempts`/… are v2-only). Order key: `time_updated DESC, id DESC`.
+- `session_message` — `id` (global PK), `session_id` (FK→session_v2 CASCADE), `type` (`user`/`assistant`/`system`/…), `seq` (**unique per session**), `data` = message object minus `id`/`type`; assistant parts inline in `data.content`.
+- `session_part` — forward-compat part rows, only written by newer OpenCode releases. Reads prefer them over inline content (`history.ts` `withParts`): `queries.session_messages` folds part rows back into `data.content` on export, so payloads carry what OpenCode would read.
+- `event_sequence` — durable-event watermark per session (`aggregate_id` PK). **Invariant: every session_v2 row needs one, with `seq` ≥ max message seq** — otherwise OpenCode's next append collides on the `(session_id, seq)` unique index. Every ocsm insert maintains it (`insert_session_tree`).
+- `project` / `worktree` — registry. `project.worktree` stores the canonical main checkout; `worktree` lists every checkout directory of a project. `project_directory` is deprecated — do not use.
+- `blob` / `blob_ref` — deduplicated media (`media:<sha256>` refs in message data; `experimental.media_blob`, off by default). Exported as payload `blobs` (base64) when referenced; restored on import; released (+ orphan blobs dropped) on delete.
+- `event` / `job` — deleted by `aggregate_id`/`session_id` when removing sessions.
 
-## Conventions
+Deletion (`delete_session_tree_full`): job rows → blob_ref + orphan blobs →
+event/event_sequence → the `session_v2` row itself; children
+(session_message/part/inbox/blob_ref/instruction_*) go via ON DELETE CASCADE
+(write primitives set `PRAGMA foreign_keys=ON` themselves — cascade never
+depends on the caller). Legacy v1 tables are left in place, exactly like
+OpenCode's own delete.
 
-- `load_messages()` — parses JSON `data` fields, injects `id`/`sessionID`/`time`. Used for markdown export.
-- `load_raw_messages()` — preserves original `data` JSON strings. Used for raw export (import-safe).
-- Raw export uses `dict(row)` directly — no transformation, no null dropping.
-- `SESSION_COLUMNS` — the full column set of the `session` table (29 cols as of OpenCode 1.17+). Must be kept in sync with the live schema: `insert_session` only writes keys present in the source dict, so stale columns are silently dropped on import. A previous gap (missing `path`/`agent`/`model`/`cost`/`tokens_*`/`metadata`) left imported sessions **invisible/unopenable** in the OpenCode UI because the `path` column stayed NULL. When the DB schema gains columns, extend this list (schema order, from `PRAGMA table_info(session)`).
-- `TODO_COLUMNS` — column set of the `todo` table (7 cols, composite PK `session_id + position`, all NOT NULL). OpenCode stores todos as a **whole-list snapshot**: every todowrite deletes the session's rows and re-inserts by position (`SessionTodo.update()`); the table is the only durable store (no events). Raw JSON therefore carries a `"todos"` array, restored via `insert_todos` = DELETE + reinsert (same semantics as OpenCode). `"todos"` absent (pre-0.5.0 exports) → the todo table is left untouched; `[]` → deliberately cleared. Rows missing a NOT NULL field are warned and skipped, not fatal; status/priority are copied verbatim (no enum check — OpenCode also has a `cancelled` status).
-- `opencode_paths(to_project)` — derives the two OpenCode storage-convention columns for a target project: `directory` (absolute, forward slashes, upper-cased Windows drive letter, e.g. `D:/foo`) and `path` (drive/root-stripped fallback, e.g. `foo`). OpenCode matches sessions by these **forward-slash** forms; `Path.resolve()` yields backslashes on Windows which OpenCode will NOT match, so any code writing `directory`/`path` must go through this helper. Import and sync recompute both unconditionally (they are structural identity columns, not user data). Path text inside `message`/`part.data` is handled separately by `substitute_paths` (prefix replacement).
-- `opencode_paths_for(conn, to_project)` — registry-aware `path` derivation, required since OpenCode's project-directory model (~1.18): `path` is relative to the **nearest registered directory root** (a `project.worktree` or `project_directory.directory` entry, e.g. a git worktree), `''` for a session directly at that root; only unregistered directories use the drive-strip fallback (`global`'s root is `/`, where both forms coincide). Import/move/sync use this variant (they have a connection); `opencode_paths` alone is only the fallback.
-- Markdown default dir: `<project>/.opencode/conversations/`
-- Raw default dir: `<project>/.opencode/raw_conversations/`
-- Project dir missing → fallback to `cwd`
-- Project references use `--project <path>` (directory path) — always unique
-- `project_id`: import/move/sync stamp it via `resolve_project_id` — the nearest registered root (`project.worktree` / `project_directory.directory`) covering the target directory wins; unregistered dirs get `'global'`, which is the correct id there. Never rely on OpenCode's startup repair: its global→id sweep (`fromDirectory`) only matches sessions sitting *exactly* at a worktree root, so a `'global'` session in a worktree subdir stays `'global'` forever and is invisible in the project session list (listing filters on `project_id`). For reference, OpenCode's own id algorithm: sha1(`git-remote:host/path`) of the **origin** remote > cached `<git-dir>/opencode` file > first root-commit hash > `'global'` for non-git dirs (verified against live rows; a repo whose remote is not named `origin` falls through to cache/root-commit).
-- Windows: Console initialized with `legacy_windows=False` + UTF-8 wrapper to handle CJK/emoji
+## Core Conventions
+
+- **Project identity** (`projectid.resolve_project`) replicates `Project.resolve`: realpath → nearest `.git`/`.hg` marker → git: `origin` remote URL (`sha1("git-remote:host/path")`, host lowercased, `.git`/trailing `/` stripped) > cached `<git-common-dir>/opencode` file > first root commit > `"global"`; hg: cached file > first root node; plain dir: `sha1("directory:" + realpath)`. **Windows gotcha (validated against live rows): the `directory:` hash input uses the backslash native realpath** (`C:\Users\WH` → `afaaaff9…`), while DB columns always store forward slashes (`to_storage_path`). Never "fix" either side.
+- **Placement**: import/move recompute `project_id`/`directory`/`path` for the destination (`session/transfer.ts` semantics). `path` = location relative to the resolved worktree root, `"."` at the root. Message content is NOT rewritten (matches OpenCode's own move).
+- **Project registration**: writes that place sessions also `upsert_project` (insert identity row, on conflict only reconcile `vcs`) + `register_worktree_rows` (canonical + linked worktree with strategy `git`). Reads/filters only ever `resolve_project` (pure, no writes).
+- **`--from`/`--project` resolution**: exact `project.id` match first, otherwise treated as a directory and resolved purely.
+- **Todos**: v2 has NO todo table. The snapshot lives in the last `todowrite` tool part (`state.metadata.todos`); markdown exports derive it via `queries.latest_todos`.
+- **Export payload**: `{"session": <full session_v2 row>, "messages": [<session_message rows, data parsed, parts merged>], "blobs": [...]?}` — round-trips through `import` with ids/seqs preserved (`time_updated` keeps the original value; OpenCode's own import stamps import time — deliberate divergence so sync ordering stays stable).
+- **Windows console**: UTF-8 wrapper + `legacy_windows=False`; tests that rebind `ocsm.common.console` must keep the original referenced (`_console_reference` exists for that).
 
 ## Import Safety Pipeline
 
-1. SQLite WAL checkpoint (`PRAGMA wal_checkpoint(TRUNCATE)`)
-2. Full database backup (`opencode.db.bak.<timestamp>`)
-3. Import sessions (skip existing IDs; recompute `session.directory` + `session.path` via `opencode_paths_for` to OpenCode's forward-slash convention; stamp `project_id` via `resolve_project_id`; write all `SESSION_COLUMNS` present in the source dict; insert session → message → part → todo)
-4. Tree integrity validation (all parent-child references verified)
-5. OpenCode runtime verification (`opencode db PRAGMA integrity_check`) — only when ocsm runs against the **default** DB path; `opencode db` cannot target an arbitrary file, so custom `--db` invocations skip verification instead of verifying (and rw-opening) the wrong database.
-6. Report results + backup location (user deletes backup manually)
+1. Conflict/parent checks (before anything is written)
+2. SQLite WAL checkpoint (`wal_checkpoint(TRUNCATE)`) + timestamped `.bak` backup
+3. `insert_session_tree` (register project; insert session_v2 + session_message + blobs + event_sequence watermark)
+4. `verify_database` (integrity_check, foreign_key_check, orphans, watermarks)
+5. Report + backup path (user deletes backups manually)
+
+`opencode db` no longer exists in 2.x — runtime verification is `ocsm verify`
+(SQL level). The full end-to-end check (optional, manual): copy the DB into a
+fake `XDG_DATA_HOME` tree and run `opencode --standalone session list
+--format json` from a project directory.
 
 ## Sync
 
-`sync project` reconciles DB ↔ `<project>/.opencode/raw_conversations/` both ways.
-
-- **Identity & freshness**: keyed by `session.id`; freshness compared via `session.time_updated` (ms epoch) read from the raw JSON's `session` object (NOT file mtime).
-- **Diff sides**: DB (`get_session_timestamps`), folder (`_load_folder_sessions` parses `*.json` + `*/*.json`), and the manifest (`<project>/.opencode/.ocsm-sync.json`).
-- **Classification** (`_compute_sync_diff`):
-  - only-in-DB → push to folder; only-in-folder → pull to DB
-  - both, same `time_updated` → no-op; both, different `time_updated` → conflict
-  - **Deletion detection takes precedence over add detection**: a manifest-tracked id missing from one side is classified as a deletion (not a fresh add on the other side), preventing DB-deleted sessions from being re-imported from the folder.
-- **Conflicts**: `--on-conflict ask` (interactive, requires TTY; else abort) | `newer` | `skip`.
-- **Deletion propagation**: only when manifest exists; **first sync never deletes**. Whole-tree (root removal cascades to subagents). Confirmed interactively (default N) unless `-y`; skipped in non-interactive mode without `-y`.
-- **Manifest**: atomic write (tempfile + `os.replace`); records ids present on BOTH sides after sync so a later one-sided removal is detectable. Deleting it resets to first-sync.
-- **Writes**: DB writes go through the same safety pipeline as import (checkpoint + backup + single transaction + rollback). "Update in place" = DELETE + INSERT via `replace_session` (message/part rows may have changed). The folder→DB direction rewrites `directory`/`path` via `opencode_paths_for`, stamps `project_id` via `resolve_project_id`, and writes all 29 `SESSION_COLUMNS` — identical handling to `import`, so the same schema/path fixes apply. The folder JSON's `todos` snapshot overwrites the DB's todo rows when present (snapshot semantics, same as import); files without a `todos` key (pre-0.5.0) keep the DB's rows. `replace_session`'s `delete_session_tree` still preserves todo rows — the subsequent `insert_todos` decides the final state.
-- **Subagents**: a session's direction follows its root, preserving tree integrity.
-- **Deletion cleanup**: deletion propagation to the DB uses `delete_session_tree_full` (NOT `delete_session_tree`), so `part`, `message`, `todo`, `session_message`, `session_input`, `session_share`, `session_context_epoch`, and `event`/`event_sequence` (by `aggregate_id`) are all removed — no orphaned rows. `replace_session` still uses `delete_session_tree` (which preserves those rows) because the same id is re-inserted.
+`sync project --project <path-or-id>` reconciles DB ↔
+`<project>/.opencode/raw_conversations/` both ways (v1 algorithm preserved:
+manifest `.ocsm-sync.json`, deletion detection precedence, `--on-conflict`,
+tree-follows-root, confirmed deletions). DB side filters by `project_id`.
+Writes go through the import pipeline; note each storage-layer call commits
+its own transaction (no cross-operation rollback — the timestamped backup is
+the recovery path).
 
 ## Export-then-delete
 
-`export-then-delete session|project` exports first (always raw JSON, import-safe) and only then permanently deletes from the DB. The two phases are coupled on purpose: there is no standalone delete command.
+Exports first (always raw JSON; `--format markdown` adds markdown), verifies
+every file landed, then — gated on re-typing the exact `--from` value in a
+TTY (no `-y` bypass) — deletes via `delete_session_tree_full`. Project/worktree
+registration rows are never deleted. `project --vacuum` rebuilds the file
+afterwards (non-fatal on failure).
 
-- **Mandatory explicit destination**: exactly one of `--to <dir>` / `--to-project <path>` is required (mutually exclusive). The default per-session `.opencode/raw_conversations/` location is unavailable because it may vanish when the project is deleted.
-- **Format**: `--format raw` (default) writes raw JSON only; `--format markdown` writes **both** raw JSON and markdown. Raw JSON is always written because it is the only re-importable format.
-- **Confirmation gate**: deletion requires re-typing the exact `--from` value (session ID or project path) at an interactive prompt — there is **no `-y` bypass**. Non-TTY invocations abort with an error before any DB change. EOF / Ctrl-C / any mismatch aborts (exported files are kept so the user can retry).
-- **Tree integrity**: `session` exports+deletes the whole tree (root + subagents via `get_session_tree`); `project` BFS-expands every matching root so subagents are included on both sides.
-- **Deletion**: `delete_session_tree_full` (full cascade: `part`/`message`/`session` + `todo`/`session_message`/`session_input`/`session_share`/`session_context_epoch` + `event`/`event_sequence` via `aggregate_id`). **Never touches the project tables** (`project` / `project_directory` / `permission` / `workspace`): ocsm manages conversations per folder, not OpenCode's cross-folder project model — those rows may still be in use by other worktrees' sessions (deleting them orphans every session of the same project living in other directories). Single transaction with rollback; backup via `_checkpoint_and_backup` first.
-- **Vacuum**: `project --vacuum` rebuilds the DB file after the delete transaction via `_vacuum_db` (SQLite DELETE only freelist pages, so the file — and every subsequent `.bak` backup — keeps its pre-delete size until VACUUM). Vacuum failure is non-fatal: the deletion is already committed. Session-level etd has no vacuum flag (usually too small to matter).
-- **Recovery**: the report prints a concrete `ocsm import session --from <exported.json> --to-project <path>` hint plus the backup path.
+## Testing
+
+- Synthetic DB: `uv run python -I .zcode/make_test_db.py <out.db> [--scratch-dir <dir>]` (untracked helper; real column lists, two live-resolved projects, parent/child sessions, todowrite snapshot).
+- Real-scale E2E (temp copies ONLY — the real DB stays read-only, `mode=ro` + `VACUUM INTO`): `.zcode/integration_e2e.py` covers verify/list/export/etd/import/move/sync-dry-run, then `opencode --standalone session list` from project dirs proves visibility and project-id agreement with the real binary.

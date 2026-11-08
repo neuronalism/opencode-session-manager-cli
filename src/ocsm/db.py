@@ -22,4 +22,8 @@ def resolve_db_path(path: Path | None = None) -> Path:
 def get_connection(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    # The v2 schema relies on ON DELETE CASCADE from session_v2 to its child
+    # tables; SQLite only enforces foreign keys when this pragma is on.
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
